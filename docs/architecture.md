@@ -19,144 +19,67 @@ Agents (LLM)                           Services (Deterministic, Remote GPU Pod)
 ## System DAG
 
 ```
-                      ┌──────────────────────┐
-                      │    Problem Spec /     │
-                      │       Oracle          │
-                      │                       │
-                      │  op semantics         │
-                      │  shape / dtype        │
-                      │  target GPU arch      │
-                      │  baseline perf        │
-                      │  objective function   │
-                      │  correctness tol.     │
-                      └──────────┬────────────┘
-                                 │
-                                 ▼
-                      ┌──────────────────────┐
-                      │    Orchestrator       │
-                      │                       │
-                      │  global control       │
-                      │  task state machine   │
-                      │  context mgmt         │
-                      │  round summary        │
-                      │  termination check    │
-                      └──────────┬────────────┘
-                                 │
-                                 ▼
-              ┌───────────────────────┐
-              │  Strategy Navigator   │
-              │                       │
-              │  deterministic:       │
-              │    tabu list          │
-              │    plateau detection  │
-              │  LLM reasoning:      │
-              │    direction choice   │
-              │    tradeoff analysis  │
-              │    exploit/explore    │
-              └──────────┬────────────┘
-                         │
-          mode + direction + constraints
-                         │
-                         ▼
-              ┌───────────────────────┐
-              │     Coding Agent      │
-              │                       │
-              │  EXPLOIT: param tune, │
-              │    local rewrite,     │
-              │    pattern apply      │
-              │  EXPLORE: algo change,│
-              │    recombination,     │
-              │    primitive upgrade  │
-              │                       │
-              │  output: N candidates │
-              │  each w/ intent tag   │
-              └──────────┬────────────┘
-                         │
-    ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-    Remote GPU Pod       │
-                         ▼
-              ┌───────────────────────┐
-              │   Compiler Service    │
-              │                       │
-              │  nvcc compile         │
-              │  register / smem /    │
-              │    spill stats        │
-              │  ptx + sass + cubin   │
-              │  compile warnings     │
-              │  ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-              │  correctness check:   │
-              │    ref output compare │
-              │    multi-shape + edge │
-              │    numeric tolerance  │
-              │    compute-sanitizer  │
-              │  ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-              │  static analysis:     │
-              │    resource usage     │
-              │    occupancy estimate │
-              └────┬─────────┬────────┘
-                   │         │
-              PASS │    FAIL │
-                   │         │
-                   │         ▼
-                   │  ┌─────────────┐
-                   │  │ Error       │
-                   │  │ Feedback    │──────► Coding Agent
-                   │  │             │        (short-circuit)
-                   │  │ compile err │
-                   │  │ or correct- │
-                   │  │ ness diff   │
-                   │  └─────────────┘
-                   ▼
-              ┌───────────────────────┐
-              │     Benchmarker       │
-              │                       │
-              │  fast bench:          │
-              │    warmup + stat runs │
-              │    p50 / p95 latency  │
-              │    clock & noise ctrl │
-              │  ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-              │  candidate ranking:   │
-              │    filter regression  │
-              │    select top-K       │
-              │  ─ ─ ─ ─ ─ ─ ─ ─ ─   │
-              │  deep profiling:      │
-              │    ncu: occupancy,    │
-              │      throughput,      │
-              │      cache, stalls    │
-              │    nsys: timeline,    │
-              │      overlap, memcpy  │
-              └────┬─────────┬────────┘
-                   │         │
-            top-K  │  regression
-            results│  (< threshold)
-                   │         │
-                   │         ▼
-                   │     discard
-                   │     (log to workdir)
-                   ▼
-              ┌───────────────────────┐
-              │  Profile Interpreter  │
-              │  (rule-based)         │
-              │                       │
-              │  -> bottleneck tags   │
-              │  -> opt direction map │
-              └──────────┬────────────┘
-                         │
-    ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-                         │
-                         ▼
-              ┌───────────────────────┐
-              │  Cross-Candidate      │
-              │  Analyzer (LLM)       │
-              │                       │
-              │  semantic diff        │
-              │  winning "genes"      │
-              │  recomb suggestions   │
-              └──────────┬────────────┘
-                         │
-                         ▼
-                   Orchestrator
-                   (next round)
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Problem Spec / Oracle                                                              │
+│  op semantics, shape/dtype, target GPU arch, baseline perf, objective, tolerance    │
+└──────────────────────────────────────┬──────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Orchestrator                                                                       │
+│  global control, task state machine, context mgmt, round summary, termination check │
+└──────────────────────────────────────┬──────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Strategy Navigator                                                                 │
+│  deterministic: tabu list, plateau detection                                        │
+│  LLM reasoning: direction choice, tradeoff analysis, exploit/explore decision       │
+└──────────────────────────────────────┬──────────────────────────────────────────────┘
+                                       │  mode + direction + constraints
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Coding Agent                                                                       │
+│  EXPLOIT: param tune, local rewrite, pattern apply                                  │
+│  EXPLORE: algo change, recombination, primitive upgrade                              │
+│  output: N candidates, each with intent tag                                         │
+└──────────────────────────────────────┬──────────────────────────────────────────────┘
+                                       │
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ Remote GPU Pod ─ ─ ─
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────┬───────────────────┐
+│  Compiler Service                                               │                   │
+│  nvcc compile, register/smem/spill stats, ptx+sass+cubin       │   FAIL ──────────────► Coding Agent
+│  correctness: ref compare, multi-shape, tolerance, sanitizer    │   (compile err /  │   (short-circuit)
+│  static analysis: resource usage, occupancy estimate            │    correctness)   │
+└──────────────────────────────┬──────────────────────────────────┴───────────────────┘
+                               │ PASS
+                               ▼
+┌─────────────────────────────────────────────────────────────────┬───────────────────┐
+│  Benchmarker                                                    │                   │
+│  fast bench: warmup, stat runs, p50/p95, clock & noise ctrl     │   REGRESSION ───────► discard
+│  candidate ranking: filter regression, select top-K             │   (< threshold)   │   (log to workdir)
+│  deep profiling: ncu (occupancy, throughput, cache, stalls)     │                   │
+│                  nsys (timeline, overlap, memcpy)                │                   │
+└──────────────────────────────┬──────────────────────────────────┴───────────────────┘
+                               │ top-K results
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Profile Interpreter (rule-based)                                                   │
+│  metrics → bottleneck tags → optimization direction map                              │
+└──────────────────────────────┬──────────────────────────────────────────────────────┘
+                               │
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│  Cross-Candidate Analyzer (LLM)                                                     │
+│  semantic diff between candidates, identify winning "genes", recomb suggestions     │
+└──────────────────────────────┬──────────────────────────────────────────────────────┘
+                               │
+                               ▼
+                        Orchestrator (next round)
 ```
 
 ---
