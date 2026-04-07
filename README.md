@@ -1,3 +1,3 @@
-# kerlever
+# Kerlever
 
-A Clever Kerner Harness Agentic Self-Evolution System.
+A Harness-driven Agentic Clever~Kernel Self-evolution System.
