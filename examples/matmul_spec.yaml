@@ -1,0 +1,22 @@
+op_name: matmul
+op_semantics: "C[M,N] = A[M,K] @ B[K,N]"
+shapes:
+  - [4096, 4096, 4096]
+dtype: float16
+target_gpu: A100
+baseline_perf_us: 5.0
+target_perf_us: 1.0
+tolerance: 0.05
+max_rounds: 20
+reference_kernel: |
+  __global__ void matmul(const half* A, const half* B, half* C, int M, int N, int K) {
+      int row = blockIdx.y * blockDim.y + threadIdx.y;
+      int col = blockIdx.x * blockDim.x + threadIdx.x;
+      if (row < M && col < N) {
+          half sum = 0;
+          for (int k = 0; k < K; k++) {
+              sum += A[row * K + k] * B[k * N + col];
+          }
+          C[row * N + col] = sum;
+      }
+  }
