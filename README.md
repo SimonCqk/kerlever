@@ -111,6 +111,8 @@ tests/
 
 docs/
 ├── architecture.md          # System DAG and module reference
+├── architecture-remediation.md  # Proposed architecture corrections and stronger data contracts
+├── bitter-lessons.md        # Bitter lessons from the initial architecture review
 ├── strategy-navigator.md    # Navigator design (5 phases, gates, UCB1 formula)
 ├── orchestrator/spec.md     # Orchestrator formal specification
 ├── spec-builder/spec.md     # Spec Builder formal specification
