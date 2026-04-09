@@ -1,286 +1,264 @@
-# Coding Agent Implementation Plan
+# Architecture Migration: Align Modules with Corrected Data Contracts
 
 ## Context
 
-Coding Agent 是 CUDA kernel 代码的生成器 — 接收 Strategy Navigator 的 directive，产出 N 个 kernel 候选。它是整个系统中唯一直接产出 CUDA 代码的模块。
+`docs/architecture.md` 和 `docs/bitter-lessons.md` 经过架构审查后更新，指出了 5 个必须修正的架构弱点：
 
-核心设计理念（来自研究）：
-- AutoKernel 的 6 层优化 playbook 显著提升生成质量
-- STARK/CUDA-LLM 的迭代纠错模式与我们的架构匹配
-- 硬件约束参数化对跨架构优化至关重要
-- 通用优化（__restrict__, __launch_bounds__, coalescing）应无条件应用
+1. **Baseline 未测量** — 循环从声明值而非测量值开始
+2. **策略信号单位不一致** — 绝对延迟 delta 与相对增益混用
+3. **搜索记忆太弱** — tabu 是扁平字符串列表，不是 typed 记录
+4. **Profile 证据丢失** — 只保留 bottleneck tags，丢失 metrics 和 rule_trace
+5. **目标太标量** — 单个 latency 数值代替多形状工作负载目标
 
-## Decisions Made
+这些修正相互关联（BaselineArtifact 依赖 ObjectiveScore，TabuEntry 依赖 AttemptRecord），因此一次性全部迁移。
 
-- 内建 6 层 CUDA 优化 playbook，作为 system prompt 的结构化知识库
-- Agent 内部做基本代码校验（regex-level: __global__, __launch_bounds__, __restrict__, 括号匹配）
-- 内置硬编码 GPU 约束表（A100/H100/V100 等常见 GPU 的 smem/register/TC/async copy 约束）
-- LLM 用 Anthropic Claude SDK via LLMClientProtocol（复用公共 llm_client.py）
+### 用户决策
 
-## File Manifest
+- **迁移范围**: 5 个 correction 全部一次做完
+- **YAML 兼容**: 直接迁移到新格式，不保留向后兼容
+- **Bootstrap**: 在 spec 中定义行为，代码暂不实现（等 GPU Pipeline 就绪后实现）
+
+---
+
+## Phase 1: Spec 更新（并行 4 个 Architect Agent）
+
+先更新所有 spec 文档，验证一致性后再动代码。每个 Architect 负责一个模块的 spec.md。
+
+### 1A. Orchestrator Spec 更新 (`docs/orchestrator/spec.md`)
+
+这是最大的变更，因为 Orchestrator spec 的 §5 Interfaces 定义了所有共享类型。
+
+**§2 Requirements 变更:**
+- 新增 REQ-ORCH-009: Baseline Bootstrap（spec 描述行为，标注 V2 实现）
+- REQ-ORCH-003: Global best tracking 从 scalar latency 改为 objective score 比较
+- REQ-ORCH-001: 终止条件改为 `incumbent.objective_score.value <= target_metric_value`
+
+**§5 Interfaces / 共享类型变更:**
+
+新增类型（来自 architecture.md）:
+- `ShapeCase(shape_id, dims, weight, correctness_tolerance, profile)`
+- `PerformanceObjective(primary_metric, aggregation, regression_guard_pct)`
+- `StaticAnalysis(registers_per_thread, smem_bytes_per_block, spill_stores, spill_loads, occupancy_estimate_pct)`
+- `ShapeBenchResult(shape_id, latency_p50_us, latency_p95_us, stdev_us, run_count)`
+- `ObjectiveScore(metric_name, value, relative_to_baseline, relative_to_incumbent)`
+- `BaselineArtifact(kernel_hash, source_code, compile_artifact, benchmark_results, objective_score, profile_bundle)`
+- `CandidateIntent(direction, mode, sub_mode, rationale)`
+- `AttemptRecord(round_number, candidate_hash, base_kernel_hash, direction, sub_mode, outcome, objective_score)`
+- `TabuEntry(base_kernel_hash, direction, sub_mode, round_number, expires_after_round)`
+- `CorrectnessResult(passed, failing_shape_ids, max_abs_error, max_rel_error)`
+- `BenchmarkBundle(shape_results, objective_score, regressed_vs_incumbent)`
+- `ProfileMetrics(achieved_occupancy_pct, dram_throughput_pct_of_peak, ... 8 fields)`
+- `BottleneckAssessment(tags, primary_tag, evidence, rule_trace)`
+- `ProfileBundle(shape_id, metrics, assessment)`
+
+修改类型:
+- `ProblemSpec`: `shapes` → `shape_cases: list[ShapeCase]`，删除 `baseline_perf_us`/`target_perf_us`/`tolerance`，新增 `objective: PerformanceObjective`、`target_metric_value: float`
+- `KernelCandidate`: `intent_tag` → `intent: CandidateIntent`，`parent_hash` → `parent_hashes: list[str]`
+- `EvaluationResult`: 分离 compile_status/static_analysis/correctness/benchmark/profile
+- `RoundSummary`: 新增 `best_objective_score`、`abs_gain_vs_prev_best_us`、`rel_gain_vs_prev_best`，删除 `best_latency_us`/`improvement_over_prev_best`
+- `OptimizationState`: 新增 `baseline: BaselineArtifact`、`incumbent: BaselineArtifact`，`tabu_list` → `attempts: list[AttemptRecord]` + `tabu_entries: list[TabuEntry]`，`bottleneck_history` → `list[BottleneckAssessment]`
+
+Protocol 签名变更:
+- `GPUPipelineProtocol.evaluate()`: 参数从 `current_best_latency_us: float` 改为 `baseline: BaselineArtifact, incumbent: BaselineArtifact`
+- 其余 Protocol 签名不变（但消费的类型字段变了）
+
+**§6 Behavioral Specification 变更:**
+- 6.1 新增 Stage 0: Baseline Bootstrap（spec-only，标注 "V2: 当 GPU Pipeline 实现后启用"）
+- 6.4 Global Best Update: 用 `objective_score.value` 代替 `latency_us`
+- 6.5 Termination: `incumbent.objective_score.value <= target_metric_value`
+- 6.6 Tabu Management: 写入 `AttemptRecord` + `TabuEntry`，不再是 flat string append
+- 6.7 RoundSummary: 计算 abs 和 rel gains
+
+### 1B. Navigator Spec 更新 (`docs/navigator/spec.md`)
+
+**§5 输入类型引用更新:**
+- OptimizationState 字段变更（baseline/incumbent/attempts/tabu_entries/bottleneck_history）
+- RoundSummary 字段变更（rel_gain_vs_prev_best 代替 improvement_over_prev_best）
+
+**§6 Behavioral Specification 变更:**
+- 6.1 Signal Computation:
+  - `avg_delta` 改用 `rel_gain_vs_prev_best`（相对增益，不是绝对 delta）
+  - `stable_bottleneck` 从 `list[list[str]]` 改为 `list[BottleneckAssessment]`，读 `primary_tag`
+  - `direction_attempt_counts` 从 RoundSummary 改为从 `AttemptRecord` 统计
+  - `exhausted_directions` 同上
+- 6.2 Gate Logic:
+  - Gate 3 Near Target: `incumbent.objective_score.value <= target_metric_value / target_threshold`（用 objective ratio）
+- 6.3 LLM Reasoning:
+  - Context assembly 使用 `rel_gain_vs_prev_best`、`BottleneckAssessment.evidence`
+  - Tabu validation 使用 typed `TabuEntry` 匹配
+- 6.4 UCB1:
+  - `avg_perf_gain` 改用 `rel_gain_vs_prev_best`（相对增益）
+- 6.5 Assembly:
+  - Tabu filter 使用 `TabuEntry(base_hash, direction, sub_mode)` 而非 flat string
+  - Output tabu 字段类型更新
+
+### 1C. Coding Agent Spec 更新 (`docs/coding-agent/spec.md`)
+
+**§5 接口类型引用更新:**
+- `KernelCandidate` 字段变更: `intent: CandidateIntent` 代替 `intent_tag: str`，`parent_hashes: list[str]` 代替 `parent_hash: str | None`
+- `ProblemSpec` 字段变更: `shape_cases` 代替 `shapes`
+
+**§6 Behavioral Specification 变更:**
+- 6.3 Prompt Builder: DE_NOVO prompt 使用 `shape_cases[].dims` 代替 `shapes`
+- 6.5 Generation Flow Step 5: Candidate assembly 使用 `CandidateIntent(direction, mode, sub_mode, rationale)` 代替 `intent_tag`
+- 6.5 Generation Flow Step 5: `parent_hashes = [directive.base_kernel_hash]` 代替 `parent_hash = directive.base_kernel_hash`
+
+### 1D. Spec Builder Spec 更新 (`docs/spec-builder/spec.md`)
+
+**§2 Requirements 变更:**
+- REQ-SB-001: Batch validation 适配新 ProblemSpec 结构
+
+**§6 Behavioral Specification 变更:**
+- 6.2 Deterministic Checks:
+  - Check 3: `shape_cases` 验证（shape_id 唯一、dims 正整数、weight > 0、correctness_tolerance 合理）
+  - Check 5: `target_metric_value > 0`，`objective.primary_metric` 合法，`objective.aggregation` 合法，`objective.regression_guard_pct >= 0`
+  - 删除: baseline_perf_us/target_perf_us/tolerance 验证
+- 6.5 Interactive Mode: 新字段 schema（shape_cases, objective, target_metric_value）
+- YAML 格式示例更新
+
+---
+
+## Phase 2: Code 更新
+
+Spec 通过审查后，进入代码实现。
+
+### 2A. Foundation: types.py + protocols.py + problem_spec.py（必须先做）
+
+这是所有模块的基础。按 architecture.md 的数据合约更新 types.py 中的所有类型。
+
+**文件:**
+- `src/kerlever/types.py` — 全部类型重写
+- `src/kerlever/protocols.py` — GPUPipelineProtocol 签名更新
+- `src/kerlever/problem_spec.py` — load 逻辑适配新 ProblemSpec
+- `examples/matmul_spec.yaml` — 更新为新 YAML 格式
+
+### 2B. Orchestrator 更新（依赖 2A）
+
+**文件:**
+- `src/kerlever/orchestrator.py` — 主循环适配新类型：
+  - Bootstrap stage（spec-only: 暂用声明值构建初始 BaselineArtifact）
+  - Global best → incumbent 比较使用 objective_score
+  - Termination 使用 objective_score
+  - 每轮记录 AttemptRecord
+  - TabuEntry 管理（带 expiry）
+  - BottleneckAssessment 收集
+  - RoundSummary 计算 abs + rel gains
+- `src/kerlever/state.py` — 适配新 OptimizationState 结构
+- `src/kerlever/stubs.py` — 全部 stub 适配新类型
+- `tests/test_orchestrator.py` — 所有测试适配新类型
+- `tests/test_state.py` — state persistence 测试适配
+- `tests/test_problem_spec.py` — ProblemSpec loading 测试适配
+
+### 2C. Navigator 更新（依赖 2A，可与 2B/2D/2E 并行）
+
+**文件:**
+- `src/kerlever/navigator/types.py` — DerivedSignals 适配（avg_delta 为 relative）
+- `src/kerlever/navigator/signals.py` — 用 rel_gain，读 BottleneckAssessment.primary_tag，从 AttemptRecord 统计
+- `src/kerlever/navigator/gates.py` — near-target 用 objective ratio
+- `src/kerlever/navigator/llm_reasoning.py` — context assembly 使用新类型
+- `src/kerlever/navigator/ucb1.py` — 用 rel_gain
+- `src/kerlever/navigator/assembly.py` — typed TabuEntry 过滤
+- `tests/test_navigator/` — 全部测试文件适配
+
+### 2D. Coding Agent 更新（依赖 2A，可与 2B/2C/2E 并行）
+
+**文件:**
+- `src/kerlever/coding_agent/__init__.py` — generate() 适配新 KernelCandidate
+- `src/kerlever/coding_agent/generator.py` — CandidateIntent + parent_hashes 构建
+- `src/kerlever/coding_agent/prompt_builder.py` — shape_cases 代替 shapes
+- `src/kerlever/coding_agent/code_validator.py` — ProblemSpec.dtype 访问路径不变
+- `tests/test_coding_agent/` — 测试适配
+
+### 2E. Spec Builder 更新（依赖 2A，可与 2B/2C/2D 并行）
+
+**文件:**
+- `src/kerlever/spec_builder/__init__.py` — 适配新 ProblemSpec
+- `src/kerlever/spec_builder/deterministic.py` — 6 个检查类别全部重写
+- `src/kerlever/spec_builder/llm_judge.py` — 新 ProblemSpec 序列化
+- `src/kerlever/spec_builder/interactive.py` — 新字段 schema
+- `src/kerlever/spec_builder/__main__.py` — CLI 适配
+- `tests/test_spec_builder/` — 全部测试适配
+
+---
+
+## Execution Strategy
 
 ```
-src/kerlever/coding_agent/
-    __init__.py              # 公共 API: CodingAgent class
-    config.py                # CodingAgentConfig: 代码生成参数
-    playbook.py              # 6 层 CUDA 优化 playbook (结构化知识库)
-    hardware.py              # GPU 硬件约束表 (A100/H100/V100 etc.)
-    prompt_builder.py        # system prompt + user prompt 组装
-    code_validator.py        # regex-level CUDA 代码校验
-    generator.py             # LLM 代码生成 + 解析 + 重试逻辑
-    types.py                 # CodingAgent 内部类型
-tests/test_coding_agent/
-    __init__.py
-    test_playbook.py         # playbook 查询测试
-    test_hardware.py         # GPU 约束查询测试
-    test_prompt_builder.py   # prompt 组装测试
-    test_code_validator.py   # 代码校验测试
-    test_generator.py        # 代码生成 (stub LLM) 测试
-    test_coding_agent.py     # 端到端集成测试
+Phase 1: Spec 更新
+    ├── Architect: Orchestrator spec (1A)  ─┐
+    ├── Architect: Navigator spec (1B)     ─┤ 并行
+    ├── Architect: Coding Agent spec (1C)  ─┤
+    └── Architect: Spec Builder spec (1D)  ─┘
+    ↓ Manager 验证所有 spec 一致性
+    ↓ 用户确认
+
+Phase 2: Code 更新
+    Step 1: Coding Agent → Foundation types (2A)
+    Step 2:
+    ├── Coding Agent: Orchestrator (2B)  ─┐
+    ├── Coding Agent: Navigator (2C)     ─┤ 并行
+    ├── Coding Agent: Coding Agent (2D)  ─┤
+    └── Coding Agent: Spec Builder (2E)  ─┘
+    ↓ Manager: ruff + mypy + pytest 全量验证
+    ↓ 修复 → 迭代直到通过
 ```
 
-## Architecture
+---
 
-### 生成流程
+## Bootstrap 处理方案（临时方案）
 
-```
-StrategyDirective + ProblemSpec + current_best_source
-    │
-    ▼
-Step 1: Resolve context
-    - 从 directive 提取: mode, direction, sub_mode, num_candidates, constraints
-    - 查 GPU 约束表: 目标 GPU 的 smem/register/TC/async 能力
-    - 查 playbook: direction 对应的优化技术 + 代码模板
-    │
-    ▼
-Step 2: Build prompts (per candidate)
-    - system prompt: CUDA 专家角色 + 6 层 playbook (相关层) + GPU 约束 + 代码规范
-    - user prompt: op 语义 + shapes/dtype + direction + base kernel (if exploit)
-    - 每个候选 prompt 略有变化 (temperature/variation hint)
-    │
-    ▼
-Step 3: Generate (parallel LLM calls)
-    - N 次 LLM 调用 (asyncio.TaskGroup)
-    - 解析 CUDA 代码块 (```cuda ... ```)
-    - 基本校验 (code_validator)
-    │
-    ▼
-Step 4: Validate & assemble
-    - 校验通过 → 构建 KernelCandidate
-    - 校验失败 → retry 一次 (带具体错误反馈)
-    - 二次失败 → skip 该候选
-    - 计算 code_hash (SHA256)
-    │
-    ▼
-Output: list[KernelCandidate]
-```
+由于 GPU Pipeline 仍是 stub，Bootstrap 阶段暂不实现真实逻辑。临时方案：
 
-### 6 层 Playbook (playbook.py)
+1. Spec 中完整定义 Bootstrap 行为（Stage 0: resolve → compile → correctness → benchmark → profile → seed state）
+2. Orchestrator 代码中：用声明式初始值构建 `BaselineArtifact`，不调用 GPU Pipeline
+3. 具体：从 ProblemSpec 的 `reference_kernel` 构建 source_code，hash 计算，benchmark/profile 字段用合理默认值
+4. Stub 中：StubGPUPipeline 新增 `bootstrap()` 方法返回模拟的 BaselineArtifact
+5. 标注 TODO: "当 GPU Pipeline 实现后，替换为真实 bootstrap"
 
-按 bottleneck 类型和优化层级组织的结构化知识库：
+---
 
-```
-Layer 1: Block/Grid Configuration (通用, 10-50% 收益)
-    - block_size_tuning: 128/256/512, 必须是 32 的倍数
-    - grid_sizing: ceiling division, wave quantization awareness
-    - __launch_bounds__ 声明
+## Verification
 
-Layer 2: Memory Access Optimization (memory-bound, 10-30%)
-    - coalesced_access: 连续线程访问连续地址
-    - shared_memory_tiling: tile 到 smem, __syncthreads()
-    - vectorized_loads: float4/int4, 128-bit transactions
-    - async_copy: cp.async (Ampere+) / TMA (Hopper+)
-    - bank_conflict_avoidance: padding (+1) / swizzling
+Phase 1 后:
+- 读每个 spec，确认 SC-* 覆盖、SCN-* GIVEN/WHEN/THEN 格式、REQ-* 与 architecture.md 一致
+- 交叉检查: 一个 spec 引用的类型与 orchestrator spec §5 定义一致
 
-Layer 3: Compute Optimization (compute-bound, 5-15%)
-    - mixed_precision: FP16 compute, FP32 accumulate
-    - tensor_core_utilization: wmma/mma.sync, tile alignment
-    - loop_unrolling: #pragma unroll
-    - fma_utilization: fused multiply-add
+Phase 2 后:
+- `ruff check .` — lint 通过
+- `mypy --strict .` — 类型检查通过
+- `pytest` — 所有测试通过（测试会同步更新）
+- 手动检查: `examples/matmul_spec.yaml` 能被 load_problem_spec 正确加载
+- 检查无 dead code、TODO（除了标注的 bootstrap TODO）
 
-Layer 4: Advanced Techniques (5-20%)
-    - thread_coarsening: 每线程处理多元素
-    - kernel_fusion: 合并多 kernel 减少全局内存往返
-    - persistent_kernels: grid = SM count, 线程循环处理工作
-    - split_k: K 维度并行化
-
-Layer 5: Architecture-Specific (5-15%)
-    - ampere: cp.async, L2 persistence, 164KB smem
-    - hopper: TMA, clusters, distributed smem, 228KB smem, FP8
-    - register_spilling_to_smem: CUDA 13+ PTX pragma
-
-Layer 6: Kernel-Specific Algorithms
-    - matmul: Goto's algorithm, hierarchical tiling
-    - attention: online softmax (Flash Attention)
-    - reduction: warp shuffle, block-level tree reduction
-    - normalization: Welford's online algorithm
-    - conv: im2col, implicit GEMM, Winograd
-```
-
-每个技术条目包含: 名称、适用条件、预期收益范围、代码模板/示例、注意事项。
-
-### GPU 约束表 (hardware.py)
-
-```python
-GPU_SPECS = {
-    "A100": GPUSpec(
-        arch="sm_80", smem_per_sm_kb=164, max_smem_per_block_kb=163,
-        registers_per_sm=65536, max_registers_per_thread=255,
-        max_warps_per_sm=64, max_threads_per_block=1024,
-        hbm_bandwidth_tbps=2.0, l2_cache_mb=40,
-        supports_cp_async=True, supports_tma=False,
-        supports_fp8=False, tensor_core_types=["fp16","bf16","tf32","fp64","int8","int4"],
-    ),
-    "H100": GPUSpec(
-        arch="sm_90", smem_per_sm_kb=228, max_smem_per_block_kb=227,
-        registers_per_sm=65536, max_registers_per_thread=255,
-        max_warps_per_sm=64, max_threads_per_block=1024,
-        hbm_bandwidth_tbps=3.35, l2_cache_mb=50,
-        supports_cp_async=True, supports_tma=True,
-        supports_fp8=True, tensor_core_types=["fp16","bf16","tf32","fp64","int8","fp8"],
-    ),
-    ...
-}
-```
-
-### 代码校验 (code_validator.py)
-
-regex-level 的基本检查，不编译：
-
-1. `__global__` 函数存在
-2. `__launch_bounds__` 存在（warn if missing, not fail）
-3. `__restrict__` 在指针参数上（warn if missing）
-4. 括号/花括号平衡
-5. 不含明显的 host-only API（malloc, printf 非 debug, std:: 等）
-6. 内核签名匹配 ProblemSpec 的 dtype (e.g., half* for float16)
-7. 不含空 kernel body（至少有赋值或计算语句）
-
-校验结果: list[CodeIssue(severity, message)]。severity=error 时 reject。
-
-### Prompt 设计 (prompt_builder.py)
-
-**System prompt 结构:**
-```
-你是 CUDA kernel 优化专家。
-
-## 代码规范 (必须遵守)
-- __launch_bounds__(maxThreads, minBlocks) 必须声明
-- 所有指针参数使用 __restrict__ 和 const (只读参数)
-- block size 必须是 32 的倍数
-- bounds-check 所有全局内存访问
-- 使用 ceiling division: (N + BLOCK_SIZE - 1) / BLOCK_SIZE
-
-## 目标 GPU 约束
-{gpu_spec_summary}
-
-## 优化 Playbook (当前方向相关)
-{relevant_playbook_layers}
-
-## 输出格式
-返回一个 ```cuda 代码块，包含完整的 kernel 函数。不要包含 host 代码。
-```
-
-**User prompt 结构 (按 sub_mode 变化):**
-
-EXPLOIT/LOCAL_REWRITE:
-```
-优化方向: {direction}
-当前最优 kernel:
-```cuda
-{current_best_source}
-```
-任务: 对上述 kernel 做局部重写，目标是 {direction}。
-约束: {hard_constraints}
-```
-
-EXPLOIT/PARAM_SEARCH:
-```
-优化方向: {direction}
-当前最优 kernel: {current_best_source}
-参数搜索范围: {search_range}
-任务: 生成一个变体，尝试参数组合 {specific_params_for_this_candidate}。
-```
-
-EXPLORE/DE_NOVO:
-```
-目标操作: {op_semantics}
-输入 shapes: {shapes}, dtype: {dtype}
-任务: 从头实现一个高性能的 {op_name} kernel。
-优化方向: {direction}
-```
-
-EXPLORE/RECOMBINATION:
-```
-Parent A: {parent_a_source}
-Parent B: {parent_b_source}
-Gene map: {gene_map}
-任务: 组合 Parent A 的 {gene_a} 和 Parent B 的 {gene_b}。
-```
-
-### CodingAgent 类
-
-```python
-class CodingAgent:
-    def __init__(self, llm_client: LLMClientProtocol, config: CodingAgentConfig | None = None):
-        ...
-
-    async def generate(self, problem_spec, directive, current_best_source) -> list[KernelCandidate]:
-        gpu_spec = get_gpu_spec(problem_spec.target_gpu)
-        playbook_context = get_relevant_playbook(directive.direction, directive.mode)
-        system_prompt = build_system_prompt(gpu_spec, playbook_context)
-
-        candidates = []
-        async with asyncio.TaskGroup() as tg:
-            tasks = [tg.create_task(
-                self._generate_one(system_prompt, problem_spec, directive, current_best_source, i)
-            ) for i in range(directive.num_candidates)]
-        for task in tasks:
-            result = task.result()
-            if result is not None:
-                candidates.append(result)
-        return candidates
-```
-
-## Implementation Sequence
-
-1. `coding_agent/types.py` — CodeIssue, GenerationResult, GPUSpec
-2. `coding_agent/hardware.py` + test_hardware.py — GPU 约束表
-3. `coding_agent/playbook.py` + test_playbook.py — 6 层 playbook
-4. `coding_agent/code_validator.py` + test_code_validator.py — regex 校验
-5. `coding_agent/config.py` — CodingAgentConfig
-6. `coding_agent/prompt_builder.py` + test_prompt_builder.py — prompt 组装
-7. `coding_agent/generator.py` + test_generator.py — LLM 生成 + 解析 + 重试
-8. `coding_agent/__init__.py` + test_coding_agent.py — CodingAgent 类
-9. 验证: ruff, mypy, pytest, orchestrator e2e 仍通过
+---
 
 ## SC-* Success Criteria
 
-- **SC-1**: DE_NOVO 模式生成 N 个 CUDA kernel 候选，每个包含 __global__ 函数
-- **SC-2**: EXPLOIT/LOCAL_REWRITE 模式在 current_best 基础上生成变体
-- **SC-3**: playbook 根据 direction 返回相关的优化技术层
-- **SC-4**: GPU 约束表对 A100/H100 返回正确的 smem/register/TC 信息
-- **SC-5**: code_validator 检出缺少 __global__ 的代码、不平衡的括号
-- **SC-6**: LLM 生成失败时 retry 一次，二次失败 skip 该候选
-- **SC-7**: 每个 KernelCandidate 有唯一 code_hash、正确的 intent_tag 和 parent lineage
-- **SC-8**: 现有 142 测试仍全部通过
-- **SC-9**: mypy --strict 和 ruff check 通过
+- **SC-1**: 所有 spec.md 反映 architecture.md 的 5 个 correction
+- **SC-2**: ProblemSpec 使用 ShapeCase + PerformanceObjective + target_metric_value
+- **SC-3**: OptimizationState 包含 baseline/incumbent BaselineArtifact
+- **SC-4**: RoundSummary 同时存储 abs_gain 和 rel_gain
+- **SC-5**: Navigator signals 使用 relative gains，gates 使用 objective ratio
+- **SC-6**: TabuEntry 和 AttemptRecord 替代 flat tabu_list
+- **SC-7**: BottleneckAssessment 替代 list[list[str]]
+- **SC-8**: EvaluationResult 分离 compile/correctness/benchmark/profile
+- **SC-9**: 全部 243+ 测试通过（测试同步更新）
+- **SC-10**: mypy --strict + ruff check 通过
 
 ## Critical Path
 
-`CodingAgent(stub_llm).generate(matmul_spec, exploit_directive, reference_kernel)` → 返回 N 个 KernelCandidate，每个包含合法 CUDA 代码。
+`load_problem_spec("matmul_spec.yaml")` → 新格式 ProblemSpec → `Orchestrator.run()` 正常运行到结束 → 所有 round 产生完整的 AttemptRecord/TabuEntry/BottleneckAssessment。
 
 ## Failure Modes
 
-- LLM 不返回 ```cuda 代码块 → 缓解: 尝试从裸文本中提取 __global__ 函数
-- LLM 生成的代码超长 → 缓解: max_tokens 限制 + 截断警告
-- 所有候选都校验失败 → 缓解: 返回空列表，Orchestrator 在下一轮 handle
-- Playbook 对未知 direction 无匹配 → 缓解: 返回通用优化 checklist (Layer 1)
-- GPU 约束表无目标 GPU → 缓解: 返回保守默认值 (48KB smem, 255 registers)
+- 类型迁移不完全: 某个模块仍引用旧字段名 → mypy --strict 会捕获
+- Spec 交叉不一致: Orchestrator spec 定义的类型与 Navigator spec 引用的不同 → Phase 1 交叉检查
+- 测试遗漏: 旧测试 hardcode 了旧类型字段 → pytest 会报错
+- Bootstrap 临时方案泄漏: 代码依赖 baseline 的真实 benchmark 数据 → 确保 stub 返回合理默认值
 
 ## Non-Goals
 
-- 不做真实 CUDA 编译（GPU pod 的事）
-- 不做 AST-level 代码分析
-- 不做 kernel 参数 auto-tuning（那是 PARAM_SEARCH + GPU pipeline 的组合）
-- 不做 multi-model LLM 支持
-- 不做代码缓存/去重（Orchestrator 的 code_hash 已处理）
+- 不实现真实 GPU Pipeline（仍为 stub）
+- 不实现真实 Cross-Candidate Analyzer（仍为 stub）
+- 不实现真实 Baseline Bootstrap 执行（spec-only + 临时声明值方案）
+- 不更新 README（这次只更新 spec + code）

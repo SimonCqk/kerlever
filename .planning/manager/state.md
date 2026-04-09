@@ -1,19 +1,18 @@
 # Manager State
 
-## Current Task
-Coding Agent module implementation — DONE
+## Current Phase
+DONE — Full migration complete
 
-## Phase
-Complete — verified
+## Verification Results
+- ruff check: ✅ All checks passed
+- mypy --strict: ✅ 32 source files, no issues
+- pytest: ✅ 257 tests passed (was 243 before migration)
+- E2E CLI: ✅ TARGET_MET in 6 rounds, objective score 0.82
 
-## Key Decisions
-- 6-layer CUDA optimization playbook in system prompt
-- Regex-level code validation (7 checks)
-- Hardcoded GPU constraint table (V100/A100/H100/T4/L40/RTX4090)
-- LLM via LLMClientProtocol, parallel N candidates via asyncio.TaskGroup
-
-## Completed Steps
-- [x] Plan written and approved
-- [x] Architect wrote docs/coding-agent/spec.md — verified (798 lines, 31 SCN-*, 6 INV-*, 8 risks)
-- [x] Coding agent implemented all files — 243 tests pass (101 new)
-- [x] Manager verified: ruff, mypy, pytest, code review, e2e backward compat
+## Completed Tasks
+- Phase 1 (Spec updates): 4/4 complete + cross-check verified
+- Phase 2A (Foundation types): complete
+- Phase 2B (Orchestrator): complete (28 tests)
+- Phase 2C (Navigator): complete (73 tests)
+- Phase 2D (Coding Agent): complete (99 tests)
+- Phase 2E (Spec Builder): complete (57 tests)
