@@ -14,9 +14,9 @@ ValidationSeverity = Literal["pass", "warn", "fail"]
 ValidationDimension = Literal[
     "schema",
     "reference_kernel",
-    "shapes",
+    "shape_cases",
     "dtype",
-    "numeric",
+    "objective",
     "target_gpu",
     "consistency",
     "specificity",

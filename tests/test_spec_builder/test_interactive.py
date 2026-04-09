@@ -6,6 +6,7 @@ Spec: docs/spec-builder/spec.md §6.5
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -32,6 +33,35 @@ _VALID_JUDGE_RESPONSE = json.dumps(
 )
 
 
+def _all_fields() -> dict[str, Any]:
+    """Return all required ProblemSpec fields with new type structure."""
+    return {
+        "op_name": "matmul",
+        "op_semantics": "C[M,N] = A[M,K] @ B[K,N]",
+        "shape_cases": [
+            {
+                "shape_id": "4k_square",
+                "dims": [4096, 4096, 4096],
+                "weight": 1.0,
+                "profile": True,
+            }
+        ],
+        "dtype": "float16",
+        "target_gpu": "A100",
+        "objective": {
+            "primary_metric": "weighted_p50_us",
+            "aggregation": "weighted_mean",
+            "regression_guard_pct": 0.0,
+        },
+        "target_metric_value": 1.0,
+        "max_rounds": 20,
+        "reference_kernel": (
+            "__global__ void matmul(const half* A, const half* B, "
+            "half* C, int M, int N, int K) { /* naive */ }"
+        ),
+    }
+
+
 class StubLLMClientForInteractive:
     """Stub LLM client that returns different responses based on call count."""
 
@@ -54,24 +84,8 @@ class TestInteractiveFullFlow:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         # LLM responses: first extraction provides all fields, then validation passes
-        all_fields = {
-            "op_name": "matmul",
-            "op_semantics": "C[M,N] = A[M,K] @ B[K,N]",
-            "shapes": [[4096, 4096, 4096]],
-            "dtype": "float16",
-            "target_gpu": "A100",
-            "baseline_perf_us": 5.0,
-            "target_perf_us": 1.0,
-            "tolerance": 0.05,
-            "max_rounds": 20,
-            "reference_kernel": (
-                "__global__ void matmul(const half* A, const half* B, "
-                "half* C, int M, int N, int K) { /* naive */ }"
-            ),
-        }
-
         extraction_response = _make_extraction_response(
-            all_fields,
+            _all_fields(),
             follow_up="",
         )
 
@@ -102,17 +116,27 @@ class TestInteractivePartialInput:
         # First response: only partial fields
         partial_response = _make_extraction_response(
             {"op_name": "matmul", "op_semantics": "C[M,N] = A[M,K] @ B[K,N]"},
-            follow_up="What are the matrix dimensions and data type?",
+            follow_up="What are the shape cases, data type, and performance objective?",
         )
 
         # Second response: remaining fields
         remaining_fields = {
-            "shapes": [[4096, 4096, 4096]],
+            "shape_cases": [
+                {
+                    "shape_id": "4k_square",
+                    "dims": [4096, 4096, 4096],
+                    "weight": 1.0,
+                    "profile": True,
+                }
+            ],
             "dtype": "float16",
             "target_gpu": "A100",
-            "baseline_perf_us": 5.0,
-            "target_perf_us": 1.0,
-            "tolerance": 0.05,
+            "objective": {
+                "primary_metric": "weighted_p50_us",
+                "aggregation": "weighted_mean",
+                "regression_guard_pct": 0.0,
+            },
+            "target_metric_value": 1.0,
             "max_rounds": 20,
             "reference_kernel": (
                 "__global__ void matmul(const half* A, const half* B, "
@@ -133,8 +157,7 @@ class TestInteractivePartialInput:
             elif call_count == 2:
                 return (
                     "4096x4096 float16 on A100, "
-                    "baseline 5us target 1us, "
-                    "tolerance 0.05, 20 rounds"
+                    "target metric 1.0 us, weighted p50, 20 rounds"
                 )
             raise EOFError
 
@@ -150,4 +173,4 @@ class TestInteractivePartialInput:
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         # Should have asked the follow-up question
-        assert "matrix dimensions" in captured.out
+        assert "shape cases" in captured.out.lower() or "shape" in captured.out.lower()

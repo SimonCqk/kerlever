@@ -10,7 +10,7 @@ import json
 import pytest
 
 from kerlever.spec_builder.llm_judge import run_llm_judge
-from kerlever.types import ProblemSpec
+from kerlever.types import PerformanceObjective, ProblemSpec, ShapeCase
 
 
 def _make_valid_spec() -> ProblemSpec:
@@ -18,12 +18,22 @@ def _make_valid_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C[M,N] = A[M,K] @ B[K,N]",
-        shapes=[[4096, 4096, 4096]],
+        shape_cases=[
+            ShapeCase(
+                shape_id="4k_square",
+                dims=[4096, 4096, 4096],
+                weight=1.0,
+                profile=True,
+            )
+        ],
         dtype="float16",
         target_gpu="A100",
-        baseline_perf_us=5.0,
-        target_perf_us=1.0,
-        tolerance=0.05,
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+            regression_guard_pct=0.0,
+        ),
+        target_metric_value=1.0,
         max_rounds=20,
         reference_kernel=(
             "__global__ void matmul(const half* A, const half* B, half* C, "

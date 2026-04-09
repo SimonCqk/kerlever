@@ -39,16 +39,21 @@ Evaluate the specification across exactly five dimensions and return a JSON \
 array. Each element must have: "dimension", "severity", and "reason".
 
 Dimensions:
-- consistency: Do the fields form a coherent specification? (shapes match \
-op_semantics, reference kernel signature matches dtype and shapes)
+- consistency: Do the fields form a coherent specification? (e.g., do the \
+shape_cases dims match the op_semantics, does the reference kernel signature \
+match the dtype and shapes, is the objective metric consistent with the \
+shape_cases weights?)
 - specificity: Is the specification precise enough for an optimization agent \
-to act on? (op_semantics unambiguous, performance target concrete)
-- feasibility: Is the performance target achievable given the hardware and \
-operation? (roofline reasoning: target within theoretical peak for target GPU)
+to act on? (e.g., are op_semantics unambiguous, is the target_metric_value \
+concrete, do shape_cases cover representative workload points?)
+- feasibility: Is the target_metric_value achievable given the hardware and \
+operation? (Use roofline reasoning: is the target_metric_value within the \
+theoretical peak for the target GPU and operation type given the shape_cases?)
 - completeness: Are all fields populated with meaningful content, or are any \
-fields placeholder stubs?
+fields placeholder stubs? Do shape_cases cover enough of the workload surface?
 - kernel_quality: Is the reference kernel a reasonable starting point? (Does \
-it implement the stated operation, is it syntactically plausible CUDA)
+it implement the stated operation, is it syntactically plausible CUDA, would \
+it compile?)
 
 Severity values: "pass", "warn", "fail".
 

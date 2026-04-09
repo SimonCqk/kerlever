@@ -5,23 +5,35 @@ Spec: docs/spec-builder/spec.md §6.2
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from kerlever.spec_builder.deterministic import run_deterministic_checks
 from kerlever.types import ProblemSpec
 
 
-def _make_valid_spec(**overrides: object) -> ProblemSpec:
+def _make_valid_spec(**overrides: Any) -> ProblemSpec:
     """Create a valid ProblemSpec with optional field overrides."""
-    defaults: dict[str, object] = {
+    defaults: dict[str, Any] = {
         "op_name": "matmul",
         "op_semantics": "C[M,N] = A[M,K] @ B[K,N]",
-        "shapes": [[4096, 4096, 4096]],
+        "shape_cases": [
+            {
+                "shape_id": "4k_square",
+                "dims": [4096, 4096, 4096],
+                "weight": 1.0,
+                "profile": True,
+            },
+        ],
         "dtype": "float16",
         "target_gpu": "A100",
-        "baseline_perf_us": 5.0,
-        "target_perf_us": 1.0,
-        "tolerance": 0.05,
+        "objective": {
+            "primary_metric": "weighted_p50_us",
+            "aggregation": "weighted_mean",
+            "regression_guard_pct": 0.0,
+        },
+        "target_metric_value": 1.0,
         "max_rounds": 20,
         "reference_kernel": (
             "__global__ void matmul(const half* A, const half* B, half* C, "
@@ -44,7 +56,6 @@ class TestValidSpecPasses:
     def test_valid_spec_may_have_no_issues(self) -> None:
         spec = _make_valid_spec()
         issues = run_deterministic_checks(spec)
-        # A valid spec should have no fail issues
         assert all(i.severity != "fail" for i in issues)
 
 
@@ -86,56 +97,56 @@ class TestDtypeCheck:
         assert dtype_fails == []
 
 
-class TestNumericChecks:
-    """Check 5: numeric sanity."""
+class TestObjectiveChecks:
+    """Check 5: objective and metric validation."""
 
-    def test_target_greater_than_baseline_fails(self) -> None:
-        spec = _make_valid_spec(baseline_perf_us=1.0, target_perf_us=5.0)
+    def test_negative_target_metric_value_fails(self) -> None:
+        """SCN-SB-001-05: target_metric_value must be > 0."""
+        spec = _make_valid_spec(target_metric_value=-1.0)
         issues = run_deterministic_checks(spec)
-        numeric_fails = [
-            i for i in issues if i.dimension == "numeric" and i.severity == "fail"
+        obj_fails = [
+            i for i in issues if i.dimension == "objective" and i.severity == "fail"
         ]
-        assert any("target_perf_us" in i.message for i in numeric_fails)
+        assert any("target_metric_value" in i.message for i in obj_fails)
 
-    def test_negative_target_fails(self) -> None:
-        spec = _make_valid_spec(target_perf_us=-1.0)
+    def test_zero_target_metric_value_fails(self) -> None:
+        spec = _make_valid_spec(target_metric_value=0.0)
         issues = run_deterministic_checks(spec)
-        numeric_fails = [
-            i for i in issues if i.dimension == "numeric" and i.severity == "fail"
+        obj_fails = [
+            i for i in issues if i.dimension == "objective" and i.severity == "fail"
         ]
-        assert any("target_perf_us" in i.message for i in numeric_fails)
+        assert any("target_metric_value" in i.message for i in obj_fails)
 
-    def test_negative_baseline_fails(self) -> None:
-        spec = _make_valid_spec(baseline_perf_us=-1.0)
+    def test_negative_regression_guard_pct_fails(self) -> None:
+        """SCN-SB-001-05: regression_guard_pct must be >= 0."""
+        spec = _make_valid_spec(
+            objective={
+                "primary_metric": "weighted_p50_us",
+                "aggregation": "weighted_mean",
+                "regression_guard_pct": -5.0,
+            }
+        )
         issues = run_deterministic_checks(spec)
-        numeric_fails = [
-            i for i in issues if i.dimension == "numeric" and i.severity == "fail"
+        obj_fails = [
+            i for i in issues if i.dimension == "objective" and i.severity == "fail"
         ]
-        assert any("baseline_perf_us" in i.message for i in numeric_fails)
-
-    def test_tolerance_out_of_range_fails(self) -> None:
-        spec = _make_valid_spec(tolerance=0.0)
-        issues = run_deterministic_checks(spec)
-        numeric_fails = [
-            i for i in issues if i.dimension == "numeric" and i.severity == "fail"
-        ]
-        assert any("tolerance" in i.message for i in numeric_fails)
-
-    def test_tolerance_of_one_fails(self) -> None:
-        spec = _make_valid_spec(tolerance=1.0)
-        issues = run_deterministic_checks(spec)
-        numeric_fails = [
-            i for i in issues if i.dimension == "numeric" and i.severity == "fail"
-        ]
-        assert any("tolerance" in i.message for i in numeric_fails)
+        assert any("regression_guard_pct" in i.message for i in obj_fails)
 
     def test_max_rounds_zero_fails(self) -> None:
         spec = _make_valid_spec(max_rounds=0)
         issues = run_deterministic_checks(spec)
-        numeric_fails = [
-            i for i in issues if i.dimension == "numeric" and i.severity == "fail"
+        obj_fails = [
+            i for i in issues if i.dimension == "objective" and i.severity == "fail"
         ]
-        assert any("max_rounds" in i.message for i in numeric_fails)
+        assert any("max_rounds" in i.message for i in obj_fails)
+
+    def test_valid_objective_passes(self) -> None:
+        spec = _make_valid_spec()
+        issues = run_deterministic_checks(spec)
+        obj_fails = [
+            i for i in issues if i.dimension == "objective" and i.severity == "fail"
+        ]
+        assert obj_fails == []
 
 
 class TestTargetGpuCheck:
@@ -163,51 +174,277 @@ class TestTargetGpuCheck:
         assert gpu_warns == []
 
 
-class TestShapesCheck:
-    """Check 3: shapes and dimensions."""
+class TestShapeCasesCheck:
+    """Check 3: shape cases validation."""
 
-    def test_empty_shapes_fails(self) -> None:
-        spec = _make_valid_spec(shapes=[])
+    def test_empty_shape_cases_fails(self) -> None:
+        spec = _make_valid_spec(shape_cases=[])
         issues = run_deterministic_checks(spec)
-        shape_fails = [
-            i for i in issues if i.dimension == "shapes" and i.severity == "fail"
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
         ]
-        assert len(shape_fails) >= 1
-        assert any("non-empty" in i.message for i in shape_fails)
+        assert len(sc_fails) >= 1
+        assert any("non-empty" in i.message for i in sc_fails)
 
     def test_negative_dimension_fails(self) -> None:
-        spec = _make_valid_spec(shapes=[[-1, 4096]])
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "neg",
+                    "dims": [-1, 4096],
+                    "weight": 1.0,
+                    "profile": True,
+                }
+            ]
+        )
         issues = run_deterministic_checks(spec)
-        shape_fails = [
-            i for i in issues if i.dimension == "shapes" and i.severity == "fail"
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
         ]
-        assert len(shape_fails) >= 1
-        assert any("positive" in i.message for i in shape_fails)
+        assert len(sc_fails) >= 1
+        assert any("positive" in i.message for i in sc_fails)
 
     def test_zero_dimension_fails(self) -> None:
-        spec = _make_valid_spec(shapes=[[0, 4096]])
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "zero",
+                    "dims": [0, 4096],
+                    "weight": 1.0,
+                    "profile": True,
+                }
+            ]
+        )
         issues = run_deterministic_checks(spec)
-        shape_fails = [
-            i for i in issues if i.dimension == "shapes" and i.severity == "fail"
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
         ]
-        assert len(shape_fails) >= 1
+        assert len(sc_fails) >= 1
 
     def test_dimension_exceeds_max_fails(self) -> None:
-        spec = _make_valid_spec(shapes=[[2**31, 4096]])
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "big",
+                    "dims": [2**31, 4096],
+                    "weight": 1.0,
+                    "profile": True,
+                }
+            ]
+        )
         issues = run_deterministic_checks(spec)
-        shape_fails = [
-            i for i in issues if i.dimension == "shapes" and i.severity == "fail"
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
         ]
-        assert len(shape_fails) >= 1
-        assert any("exceeds" in i.message for i in shape_fails)
+        assert len(sc_fails) >= 1
+        assert any("exceeds" in i.message for i in sc_fails)
 
-    def test_empty_inner_shape_fails(self) -> None:
-        spec = _make_valid_spec(shapes=[[]])
+    def test_empty_dims_fails(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "empty_dims",
+                    "dims": [],
+                    "weight": 1.0,
+                    "profile": True,
+                }
+            ]
+        )
         issues = run_deterministic_checks(spec)
-        shape_fails = [
-            i for i in issues if i.dimension == "shapes" and i.severity == "fail"
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
         ]
-        assert len(shape_fails) >= 1
+        assert len(sc_fails) >= 1
+
+    def test_duplicate_shape_id_fails(self) -> None:
+        """SCN-SB-001-03: Duplicate shape_id fails validation."""
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "square_4k",
+                    "dims": [4096, 4096, 4096],
+                    "weight": 1.0,
+                    "profile": True,
+                },
+                {
+                    "shape_id": "square_4k",
+                    "dims": [8192, 128, 4096],
+                    "weight": 0.5,
+                },
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert len(sc_fails) >= 1
+        assert any("duplicate" in i.message.lower() for i in sc_fails)
+
+    def test_empty_shape_id_fails(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {"shape_id": "", "dims": [4096], "weight": 1.0, "profile": True}
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert len(sc_fails) >= 1
+        assert any("non-empty" in i.message for i in sc_fails)
+
+    def test_zero_weight_fails(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "zero_weight",
+                    "dims": [4096],
+                    "weight": 0.0,
+                    "profile": True,
+                }
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert len(sc_fails) >= 1
+        assert any("weight" in i.message for i in sc_fails)
+
+    def test_negative_weight_fails(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "neg_weight",
+                    "dims": [4096],
+                    "weight": -1.0,
+                    "profile": True,
+                }
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert any("weight" in i.message for i in sc_fails)
+
+    def test_correctness_tolerance_out_of_range_fails(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "bad_tol",
+                    "dims": [4096],
+                    "weight": 1.0,
+                    "correctness_tolerance": 0.0,
+                    "profile": True,
+                }
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert any("correctness_tolerance" in i.message for i in sc_fails)
+
+    def test_correctness_tolerance_of_one_fails(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "tol_one",
+                    "dims": [4096],
+                    "weight": 1.0,
+                    "correctness_tolerance": 1.0,
+                    "profile": True,
+                }
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert any("correctness_tolerance" in i.message for i in sc_fails)
+
+    def test_valid_correctness_tolerance_passes(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "good_tol",
+                    "dims": [4096, 4096, 4096],
+                    "weight": 1.0,
+                    "correctness_tolerance": 0.01,
+                    "profile": True,
+                }
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert sc_fails == []
+
+    def test_no_profile_shape_warns(self) -> None:
+        """SCN-SB-001-04: No profile shape emits warning."""
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "no_profile",
+                    "dims": [4096, 4096, 4096],
+                    "weight": 1.0,
+                    "profile": False,
+                }
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_warns = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "warn"
+        ]
+        assert len(sc_warns) >= 1
+        assert any("profile" in i.message.lower() for i in sc_warns)
+        # Must not cause failure
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert sc_fails == []
+
+    def test_no_profile_default_warns(self) -> None:
+        """Omitting profile field (defaults to false) should also warn."""
+        spec = _make_valid_spec(
+            shape_cases=[
+                {"shape_id": "default_no_profile", "dims": [4096, 4096], "weight": 1.0}
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_warns = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "warn"
+        ]
+        assert len(sc_warns) >= 1
+
+    def test_multiple_shapes_with_profile_passes(self) -> None:
+        spec = _make_valid_spec(
+            shape_cases=[
+                {
+                    "shape_id": "a",
+                    "dims": [4096, 4096, 4096],
+                    "weight": 1.0,
+                    "profile": True,
+                },
+                {
+                    "shape_id": "b",
+                    "dims": [8192, 128, 4096],
+                    "weight": 0.5,
+                    "profile": False,
+                },
+            ]
+        )
+        issues = run_deterministic_checks(spec)
+        sc_fails = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "fail"
+        ]
+        assert sc_fails == []
+        sc_warns = [
+            i for i in issues if i.dimension == "shape_cases" and i.severity == "warn"
+        ]
+        assert sc_warns == []
 
 
 class TestReferenceKernelCheck:

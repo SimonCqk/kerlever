@@ -21,12 +21,11 @@ from kerlever.types import ProblemSpec
 _REQUIRED_FIELDS: list[str] = [
     "op_name",
     "op_semantics",
-    "shapes",
+    "shape_cases",
     "dtype",
     "target_gpu",
-    "baseline_perf_us",
-    "target_perf_us",
-    "tolerance",
+    "objective",
+    "target_metric_value",
     "max_rounds",
     "reference_kernel",
 ]
@@ -37,12 +36,19 @@ You are helping a user define a CUDA kernel optimization problem specification.
 The ProblemSpec has these fields:
 - op_name (str): Short name for the operation (e.g., "matmul", "softmax")
 - op_semantics (str): Mathematical description (e.g., "C[M,N] = A[M,K] @ B[K,N]")
-- shapes (list[list[int]]): Input tensor dimensions (e.g., [[4096, 4096, 4096]])
+- shape_cases (list[ShapeCase]): Workload shapes, each with:
+    - shape_id (str): Unique identifier for the shape (e.g., "4k_square")
+    - dims (list[int]): Dimension values (e.g., [4096, 4096, 4096])
+    - weight (float): Importance weight for objective aggregation (default 1.0)
+    - correctness_tolerance (float | None): Optional per-shape tolerance in (0, 1)
+    - profile (bool): Whether to deep-profile this shape (default false)
 - dtype (str): Data type (float16, float32, float64, bfloat16, int8, etc.)
 - target_gpu (str): GPU architecture (A100, H100, etc.)
-- baseline_perf_us (float): Baseline kernel latency in microseconds
-- target_perf_us (float): Target kernel latency in microseconds (must be <= baseline)
-- tolerance (float): Acceptable numerical error tolerance (0 < tolerance < 1)
+- objective (PerformanceObjective): Performance scoring, with:
+    - primary_metric: One of "weighted_p50_us", "weighted_p95_us", "worst_case_p50_us"
+    - aggregation: One of "weighted_mean", "max"
+    - regression_guard_pct (float): Regression detection threshold (default 0.0)
+- target_metric_value (float): Target value for the primary metric (must be > 0)
 - max_rounds (int): Maximum optimization rounds (>= 1)
 - reference_kernel (str): CUDA source code with __global__ or __device__ function
 
