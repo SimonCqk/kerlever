@@ -110,8 +110,7 @@ tests/
 └── test_coding_agent/       # Coding Agent (hardware, playbook, validator, generator)
 
 docs/
-├── architecture.md          # System DAG and module reference
-├── architecture-remediation.md  # Proposed architecture corrections and stronger data contracts
+├── architecture.md          # System DAG, architecture corrections, and data contracts
 ├── bitter-lessons.md        # Bitter lessons from the initial architecture review
 ├── strategy-navigator.md    # Navigator design (5 phases, gates, UCB1 formula)
 ├── orchestrator/spec.md     # Orchestrator formal specification
