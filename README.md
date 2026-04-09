@@ -1,174 +1,88 @@
 # Kerlever
 
-Agent-driven CUDA kernel optimization loop.
+Kerlever is an agent-driven CUDA kernel optimization loop.
 
-Generate kernel candidates → compile → benchmark → profile → analyze → navigate the search space → generate again. Repeat until the target latency is met or the budget is exhausted.
+The goal is simple: take a kernel plus a target workload, run real measurement on GPU hardware, use that feedback to decide what to try next, and keep iterating until the target is met or the search budget is exhausted.
 
-```
-Problem Spec
-    │
-    ▼
-Orchestrator ◄───────────────────────────────────────────────────┐
-    │                                                            │
-    ▼                                                            │
-Strategy Navigator                                               │
-    │  mode + direction + constraints                            │
-    ▼                                                            │
-Coding Agent  ◄── compile fail (retry w/ error)                  │
-    │                                                            │
-    ├─── Remote GPU Pod ───────────────────────────────────┐     │
-    │   Compiler → Benchmarker → Profile Interpreter       │     │
-    └──────────────────────────────────────────────────────┘     │
-                                                                 │
-Cross-Candidate Analyzer ────────────────────────────────────────┘
+```text
+baseline bootstrap -> generate -> compile -> benchmark -> profile -> analyze -> navigate -> generate
 ```
 
-## Design Philosophy
+## What This Project Is
 
-**Few agents, strong deterministic layers.** LLM reasoning is reserved for genuinely ambiguous decisions — tradeoff analysis, creative structural changes, cross-candidate semantic diffs. Everything else (gate checks, tabu filtering, threshold comparisons, trend computation, bottleneck tagging) is deterministic code.
+Kerlever is trying to make CUDA kernel optimization more like a disciplined search loop and less like prompt roulette.
 
-Key principles from [AGENTS.md](AGENTS.md):
+The system separates:
 
-- **First principles over pattern matching** — every optimization traces back to a quantifiable bottleneck
-- **Structured data, not natural language** — agents communicate through typed Pydantic models, not prose
-- **No over-engineering** — build the simplest thing that closes the loop
-- **Grounded in facts** — "measured 1.2ms → 0.9ms on A100, p50 over 100 runs", not "should be faster"
+- LLM work, for ambiguous decisions like structural exploration and code synthesis
+- deterministic work, for compile checks, correctness validation, benchmarking, profiling, filtering, and threshold-based control
 
-## Architecture
+That split matters. Kernel optimization should be driven by measurements, not vibes.
 
-4 LLM agents + 3 deterministic services, connected as a DAG with early-exit paths:
+## How It Works
 
-| Module | Type | Status | Role |
-|---|---|---|---|
-| **Orchestrator** | Agent | Implemented | Global control loop, state machine, round management, termination |
-| **Strategy Navigator** | Agent | Implemented | Exploit/explore decision, search direction, tabu, UCB1 fallback |
-| **Coding Agent** | Agent | Implemented | CUDA kernel generation with 6-layer optimization playbook |
-| **Cross-Candidate Analyzer** | Agent | Stub | Semantic diff, winning gene identification, recombination hints |
-| **Compiler Service** | Service | Stub | nvcc compile + correctness validation + static analysis |
-| **Benchmarker** | Service | Stub | Latency measurement + candidate ranking + deep profiling (ncu/nsys) |
-| **Profile Interpreter** | Service | Stub | Rule-based bottleneck tagging from profiling metrics |
+At a high level:
 
-### Exploit vs. Explore
+1. Start from a reference kernel and bootstrap a measured baseline on the target GPU.
+2. Ask the Strategy Navigator whether to exploit the current best kernel or explore a new direction.
+3. Ask the Coding Agent to generate candidate kernels.
+4. Compile and validate them.
+5. Benchmark passing candidates, discard regressions, and deeply profile the most promising ones.
+6. Convert profiling metrics into bottleneck assessments.
+7. Feed the results back into the next round.
 
-The optimization loop operates in two modes, selected by the Strategy Navigator:
+The important loop is:
 
-- **Exploit** — small delta on the current best kernel (param tuning, local rewrite, pattern apply). 3–8 candidates per round.
-- **Explore** — structural change (algorithm swap, de novo generation, recombination). 2–3 candidates per round.
+- exploit when the data says local improvement is still available,
+- explore when the current direction is exhausted or a structural change is justified,
+- terminate when the target objective is reached.
 
-Mode selection uses deterministic gates for clear signals (cold start → explore, plateau → explore, near target → exploit) and LLM reasoning for ambiguous cases. When the LLM fails, UCB1 provides a deterministic fallback.
+## Design Principles
 
-### Early-Exit Paths
+The project is built around a few constraints:
 
-Not every candidate goes through the full pipeline:
+- First principles over pattern matching. Every optimization direction should trace back to a measurable bottleneck.
+- Structured data over prose. Agents should exchange typed records, not hand-wavy summaries.
+- Deterministic where possible, LLM where necessary. Threshold checks, ranking, tabu logic, and bottleneck rules should live in code.
+- Grounded in facts. "Measured 1.2ms -> 0.9ms" is useful. "Should be faster" is not.
 
-| Trigger | Condition | Action |
-|---|---|---|
-| Compiler | Compile or correctness fail | Skip benchmark, feed error back to Coding Agent |
-| Benchmarker | Latency regresses beyond threshold | Discard candidate |
-| Profile Interpreter | Same bottleneck N consecutive rounds | Mark direction exhausted, force explore |
-| Orchestrator | Target latency met | Terminate, return best kernel |
+## Current Status
 
-## Project Structure
+This repo is still an early skeleton.
 
-```
-src/kerlever/
-├── __init__.py
-├── __main__.py              # CLI entry point
-├── types.py                 # Shared Pydantic models and enums
-├── protocols.py             # Protocol interfaces for all services
-├── stubs.py                 # Stub implementations for testing
-├── orchestrator.py          # Main optimization loop
-├── state.py                 # Atomic state persistence
-├── llm_client.py            # LLMClientProtocol + Anthropic implementation
-├── problem_spec.py          # ProblemSpec YAML loader
-├── spec_builder/            # Problem spec validation & interactive builder
-│   ├── deterministic.py     #   6-category structural validation
-│   ├── llm_judge.py         #   5-dimension LLM semantic judge
-│   ├── resolver.py          #   Reference kernel resolution (inline/file/URL)
-│   └── interactive.py       #   Conversational spec collection
-├── navigator/               # Strategy Navigator (5-phase decision engine)
-│   ├── signals.py           #   Derived signal computation (pure, deterministic)
-│   ├── gates.py             #   5 hard gates (first-match-wins priority)
-│   ├── llm_reasoning.py     #   LLM-based direction reasoning
-│   ├── ucb1.py              #   UCB1 deterministic fallback
-│   ├── assembly.py          #   Directive assembly (7-step)
-│   └── config.py            #   11 tunable parameters
-└── coding_agent/            # CUDA kernel code generator
-    ├── hardware.py          #   GPU constraint table (V100/A100/H100/T4/L40/RTX4090)
-    ├── playbook.py          #   6-layer CUDA optimization playbook
-    ├── prompt_builder.py    #   System + user prompt construction (5 sub-modes)
-    ├── code_validator.py    #   7 regex-level CUDA code checks
-    ├── generator.py         #   LLM generation + parse + retry + skip
-    └── config.py            #   Generation parameters
+What exists today:
 
-tests/
-├── test_orchestrator.py     # Orchestrator round loop + state machine
-├── test_state.py            # Atomic persistence
-├── test_problem_spec.py     # YAML loading + validation
-├── test_spec_builder/       # Spec validation pipeline
-├── test_navigator/          # Strategy Navigator (signals, gates, UCB1, assembly)
-└── test_coding_agent/       # Coding Agent (hardware, playbook, validator, generator)
+- the core control-plane modules,
+- typed protocols between agents and services,
+- spec and validation infrastructure,
+- strategy and code-generation scaffolding,
+- tests around the main loop and module contracts.
 
-docs/
-├── architecture.md          # System DAG, architecture corrections, and data contracts
-├── bitter-lessons.md        # Bitter lessons from the initial architecture review
-├── strategy-navigator.md    # Navigator design (5 phases, gates, UCB1 formula)
-├── orchestrator/spec.md     # Orchestrator formal specification
-├── spec-builder/spec.md     # Spec Builder formal specification
-├── navigator/spec.md        # Navigator formal specification
-└── coding-agent/spec.md     # Coding Agent formal specification
+What is still incomplete:
 
-examples/
-└── matmul_spec.yaml         # Example: 4096×4096 FP16 matmul on A100
-```
+- real GPU pipeline integration for compile, benchmark, and profiling,
+- real cross-candidate analysis,
+- full baseline seeding and stronger data contracts through the runtime path.
 
-## Coding Agent Internals
+In other words, the architecture is there, but part of the execution layer is still stubbed.
 
-The Coding Agent deserves special mention — it's the only module that directly produces CUDA code.
+## Why The Architecture Looks Like This
 
-**6-Layer Optimization Playbook** (`playbook.py`):
+Kerlever uses a small number of modules with clear roles:
 
-| Layer | Focus | Typical Gain |
-|---|---|---|
-| 1 | Block/Grid configuration | 10–50% |
-| 2 | Memory access (coalescing, tiling, vectorized loads, async copy) | 10–30% |
-| 3 | Compute (mixed precision, tensor cores, loop unrolling) | 5–15% |
-| 4 | Advanced (thread coarsening, kernel fusion, persistent kernels) | 5–20% |
-| 5 | Architecture-specific (Ampere cp.async, Hopper TMA/clusters/FP8) | 5–15% |
-| 6 | Kernel-specific algorithms (Flash Attention, Winograd, warp shuffle reduction) | varies |
+- Orchestrator, for sequencing and state management
+- Strategy Navigator, for search policy
+- Coding Agent, for kernel generation
+- deterministic GPU services, for validation and measurement
 
-**GPU Hardware Table** (`hardware.py`): Hardcoded specs for V100, A100, H100, T4, L40, RTX4090. Unknown GPUs get conservative defaults (48KB smem, sm_70). The table informs prompt construction — unsupported features (e.g., TMA on Ampere) are omitted to prevent the LLM from generating invalid code.
+The intent is to keep the system inspectable. If a decision was made, you should be able to see what metric justified it.
 
-**Code Validator** (`code_validator.py`): 7 regex-level checks run on every generated kernel, no short-circuit:
+The architecture review and its corrections live here:
 
-1. `__global__` function exists (error)
-2. `__launch_bounds__` present (warning)
-3. `__restrict__` on pointer params (warning)
-4. Bracket/brace balance (error)
-5. No host-only APIs — malloc, printf, cudaMalloc, etc. (error)
-6. Kernel signature dtype matches ProblemSpec (error)
-7. Non-empty kernel body (error)
+- [docs/architecture.md](docs/architecture.md)
+- [docs/bitter-lessons.md](docs/bitter-lessons.md)
 
-Errors → reject + retry with feedback. Warnings → pass through for information.
-
-## Stub Modules
-
-The following modules are currently stubbed (`stubs.py`) with Protocol-conforming implementations for testing:
-
-- **GPU Pipeline** (Compiler + Benchmarker + Profile Interpreter) — requires remote GPU pod infrastructure
-- **Cross-Candidate Analyzer** — LLM-powered semantic diff between candidates
-
-The stubs simulate realistic behavior: the GPU pipeline returns random latency variations with progressive improvement and occasional compile failures; the analyzer returns empty analysis. All 243 tests pass against these stubs.
-
-## Installation
-
-> _TODO_
-
-## Usage
-
-> _TODO_
-
-## Problem Spec Format
+## Example Problem Spec
 
 Optimization targets are defined in YAML:
 
@@ -197,27 +111,30 @@ reference_kernel: |
   }
 ```
 
-| Field | Description |
-|---|---|
-| `op_name` | Operation identifier (matmul, attention, reduction, etc.) |
-| `op_semantics` | Mathematical definition of the operation |
-| `shapes` | Input tensor dimensions to optimize for |
-| `dtype` | Data type (float16, float32, bfloat16, etc.) |
-| `target_gpu` | Target GPU architecture (A100, H100, V100, etc.) |
-| `baseline_perf_us` | Reference kernel latency in microseconds |
-| `target_perf_us` | Target latency to achieve |
-| `tolerance` | Acceptable margin above target (0.05 = 5%) |
-| `max_rounds` | Maximum optimization rounds before termination |
-| `reference_kernel` | CUDA source of the baseline kernel |
+This spec defines:
 
-## Tech Stack
+- what operation to optimize,
+- what shapes and dtype matter,
+- which GPU is the target,
+- what baseline and target performance mean,
+- what reference kernel the search starts from.
 
-- **Python ≥ 3.12** with asyncio
-- **Pydantic** for all data models (validation + serialization)
-- **Anthropic Claude SDK** for LLM calls (wrapped in `LLMClientProtocol` for testability)
-- **uv** as package manager
-- **pytest + pytest-asyncio** for testing (243 tests, 100% pass)
-- **mypy --strict** + **ruff** for type checking and linting
+## Development
+
+- Python >= 3.12
+- `uv` for environment management
+- `pytest` for tests
+- `mypy --strict` and `ruff` for quality gates
+
+At the time of writing, the test suite passes locally against the current skeleton and stubs.
+
+## Installation
+
+> _TODO_
+
+## Usage
+
+> _TODO_
 
 ## License
 
