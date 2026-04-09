@@ -11,7 +11,7 @@ Both modes produce the same output: a validated `ProblemSpec` that the Orchestra
 
 ### Two-Stage Validation Pipeline
 
-**Stage 1 (deterministic):** Structural and semantic checks that require no LLM. These are fast, reproducible, and always run. They cover Pydantic schema validation, reference kernel resolution and CUDA surface checks, shape/dtype/numeric sanity, and target GPU recognition.
+**Stage 1 (deterministic):** Structural and semantic checks that require no LLM. These are fast, reproducible, and always run. They cover Pydantic schema validation, reference kernel resolution and CUDA surface checks, shape cases validation, dtype recognition, objective and metric sanity, and target GPU recognition.
 
 **Stage 2 (LLM judge):** A Claude model evaluates the spec for semantic consistency, specificity, feasibility, completeness, and reference kernel quality. Returns structured JSON with five dimensions, each scored pass/warn/fail with a reason. Stage 2 is skippable via `--no-llm`.
 
@@ -22,7 +22,7 @@ Both modes produce the same output: a validated `ProblemSpec` that the Orchestra
 ### Functional Requirements
 
 **REQ-SB-001: Batch Validation** [traces SC-1]
-The `--validate` command must accept a YAML file path, run the two-stage validation pipeline, and return a structured result. The result is `is_valid=True` when all deterministic checks pass and no LLM dimension scores `fail`. When any check fails, the result is `is_valid=False` with a list of structured errors identifying which checks failed and why.
+The `--validate` command must accept a YAML file path containing the new ProblemSpec structure (with `shape_cases`, `objective`, and `target_metric_value` fields), run the two-stage validation pipeline, and return a structured result. The result is `is_valid=True` when all deterministic checks pass and no LLM dimension scores `fail`. When any check fails, the result is `is_valid=False` with a list of structured errors identifying which checks failed and why.
 
 **REQ-SB-002: Reference Kernel Resolution** [traces SC-2]
 The `reference_kernel` field in the YAML input supports three forms: an inline CUDA source string, a `file:///path` URI pointing to a local `.cu` file, and an `https://...` URL pointing to a remote source. The resolver must detect the form, fetch the content, and replace the field value with the resolved CUDA source code. After resolution, the source must contain at least one `__global__` or `__device__` function signature.
@@ -54,21 +54,43 @@ All source code passes `ruff check` with zero errors.
 **SCN-SB-001-01: Valid YAML passes batch validation**
 - GIVEN: a YAML file with all required `ProblemSpec` fields populated correctly
 - AND: the `reference_kernel` contains inline CUDA source with a `__global__` function
-- AND: shapes are non-empty with all positive dimensions
+- AND: `shape_cases` is a non-empty list with unique `shape_id` values, positive dims, and positive weights
+- AND: at least one ShapeCase has `profile: true`
 - AND: dtype is a recognized CUDA type
 - AND: target_gpu is a known GPU architecture
-- AND: baseline_perf_us > target_perf_us > 0
-- AND: 0 < tolerance < 1
+- AND: `objective.primary_metric` is a recognized metric and `objective.aggregation` is a recognized aggregation
+- AND: `target_metric_value` > 0
 - AND: max_rounds >= 1
 - WHEN: `--validate spec.yaml` is run
 - THEN: the result has `is_valid=True` and an empty error list
 
 **SCN-SB-001-02: Invalid YAML fails with structured errors**
-- GIVEN: a YAML file where `dtype` is "imaginary_type" and `target_perf_us` is negative
+- GIVEN: a YAML file where `dtype` is "imaginary_type" and `objective.primary_metric` is "invalid_metric"
 - WHEN: `--validate spec.yaml` is run
 - THEN: the result has `is_valid=False`
 - AND: the error list contains one entry identifying the unrecognized dtype
-- AND: the error list contains one entry identifying the invalid target performance value
+- AND: the error list contains one entry identifying the invalid objective metric
+
+**SCN-SB-001-03: Duplicate shape_id fails validation**
+- GIVEN: a YAML file where `shape_cases` contains two entries both with `shape_id: "square_4k"`
+- WHEN: `--validate spec.yaml` is run
+- THEN: the result has `is_valid=False`
+- AND: the error list contains one entry identifying the duplicate shape_id
+
+**SCN-SB-001-04: No profile shape emits warning**
+- GIVEN: a YAML file where all ShapeCase entries have `profile: false` (or omit the field, defaulting to false)
+- AND: all other fields are valid
+- WHEN: `--validate spec.yaml` is run
+- THEN: the result has `is_valid=True` (warnings do not cause failure)
+- AND: the issue list contains one entry with dimension="shape_cases" and severity=warn indicating no shape is marked for profiling
+
+**SCN-SB-001-05: Invalid objective fields fail validation**
+- GIVEN: a YAML file where `target_metric_value` is -1.0
+- AND: `objective.regression_guard_pct` is -5.0
+- WHEN: `--validate spec.yaml` is run
+- THEN: the result has `is_valid=False`
+- AND: the error list contains one entry identifying the non-positive target_metric_value
+- AND: the error list contains one entry identifying the negative regression_guard_pct
 
 **SCN-SB-002-01: File URI reference kernel resolution**
 - GIVEN: a YAML file where `reference_kernel` is `file:///tmp/kernel.cu`
@@ -133,7 +155,7 @@ All source code passes `ruff check` with zero errors.
 **SCN-SB-005-02: Interactive collection handles partial input**
 - GIVEN: a stub LLM client and a mock stdin
 - WHEN: the user's first message provides only `op_name` and `op_semantics`
-- THEN: the system identifies the remaining missing fields
+- THEN: the system identifies the remaining missing fields (including `shape_cases`, `objective`, `target_metric_value`, `dtype`, `target_gpu`, `max_rounds`, `reference_kernel`)
 - AND: asks follow-up questions for those fields specifically
 
 ---
@@ -181,8 +203,8 @@ Exit codes: 0 on success (valid spec or interactive completion), 1 on validation
 ValidationSeverity: Literal["pass", "warn", "fail"]
 
 ValidationDimension: Literal[
-    "schema", "reference_kernel", "shapes", "dtype",
-    "numeric", "target_gpu",
+    "schema", "reference_kernel", "shape_cases", "dtype",
+    "objective", "target_gpu",
     "consistency", "specificity", "feasibility",
     "completeness", "kernel_quality",
     "parse_error"
@@ -200,7 +222,7 @@ ValidationResult:
 
 `is_valid` is True when no issue has `severity="fail"`. Issues with `severity="warn"` do not cause failure.
 
-Dimensions "schema" through "target_gpu" are deterministic (Stage 1). Dimensions "consistency" through "kernel_quality" are LLM judge (Stage 2). "parse_error" is used only for LLM response parse failures.
+Dimensions "schema" through "target_gpu" are deterministic (Stage 1). The deterministic dimensions are: "schema", "reference_kernel", "shape_cases", "dtype", "objective", "target_gpu". Dimensions "consistency" through "kernel_quality" are LLM judge (Stage 2). "parse_error" is used only for LLM response parse failures.
 
 ### LLMClientProtocol
 
@@ -218,13 +240,22 @@ The LLM client is injected into both the LLM judge and the interactive collector
 ```yaml
 op_name: matmul
 op_semantics: "C[M,N] = A[M,K] @ B[K,N]"
-shapes:
-  - [4096, 4096, 4096]
 dtype: float16
 target_gpu: A100
-baseline_perf_us: 5.0
-target_perf_us: 1.0
-tolerance: 0.05
+shape_cases:
+  - shape_id: "4k_square"
+    dims: [4096, 4096, 4096]
+    weight: 1.0
+    profile: true
+  - shape_id: "tall_skinny"
+    dims: [8192, 128, 4096]
+    weight: 0.5
+    correctness_tolerance: 0.01
+objective:
+  primary_metric: weighted_p50_us
+  aggregation: weighted_mean
+  regression_guard_pct: 0.0
+target_metric_value: 1.0
 max_rounds: 20
 reference_kernel: |
   __global__ void matmul(const half* A, const half* B, half* C, int M, int N, int K) {
@@ -243,7 +274,7 @@ reference_kernel: "https://example.com/kernel.cu"
 
 ### YAML Output Format (Interactive Mode)
 
-Same schema as the input format. The `reference_kernel` field contains the resolved inline CUDA source, never a URI.
+Same schema as the input format. The `reference_kernel` field contains the resolved inline CUDA source, never a URI. All `shape_cases` entries are preserved as-is. The `objective` block is included in the output.
 
 ---
 
@@ -283,22 +314,27 @@ The YAML content must parse into a valid `ProblemSpec` via Pydantic. Missing req
 **Check 2 -- Reference kernel resolution:**
 Covered by the resolver (section 6.1). If resolution failed, a single issue with dimension="reference_kernel" and severity=fail is added. If resolution succeeded but the source is suspiciously short (fewer than 20 non-whitespace characters), an issue with severity=warn is added.
 
-**Check 3 -- Shapes and dimensions:**
-- `shapes` must be a non-empty list.
-- Each shape must be a non-empty list of positive integers.
-- No dimension may exceed 2^31 - 1 (maximum 32-bit int, the common CUDA kernel argument limit).
-- Violations produce issues with dimension="shapes" and severity=fail.
+**Check 3 -- Shape cases validation:**
+- `shape_cases` must be a non-empty list.
+- Each ShapeCase must have a non-empty `shape_id` string.
+- All `shape_id` values must be unique across the list. Duplicate shape_ids produce an issue with severity=fail.
+- Each ShapeCase.`dims` must be a non-empty list of positive integers.
+- No dimension in `dims` may exceed 2^31 - 1 (maximum 32-bit int, the common CUDA kernel argument limit).
+- Each ShapeCase.`weight` must be greater than 0.
+- If `correctness_tolerance` is provided, it must be in the range (0, 1) exclusive.
+- At least one ShapeCase should have `profile: true`. If no ShapeCase has `profile: true`, produce an issue with severity=warn (the system can still run but deep profiling will have no designated shapes).
+- Violations produce issues with dimension="shape_cases" and severity=fail (except the missing profile flag which is severity=warn).
 
 **Check 4 -- Dtype recognition:**
 `dtype` must be one of a recognized set: `float16`, `float32`, `float64`, `bfloat16`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`. An unrecognized dtype produces an issue with dimension="dtype" and severity=fail.
 
-**Check 5 -- Numeric sanity:**
-- `baseline_perf_us` must be positive.
-- `target_perf_us` must be positive.
-- `target_perf_us` must be less than or equal to `baseline_perf_us` (the target should be faster or equal to the baseline; a target slower than the baseline is nonsensical).
-- `tolerance` must be in the range (0, 1) exclusive.
+**Check 5 -- Objective and metric validation:**
+- `target_metric_value` must be greater than 0.
+- `objective.primary_metric` must be one of: `"weighted_p50_us"`, `"weighted_p95_us"`, `"worst_case_p50_us"`.
+- `objective.aggregation` must be one of: `"weighted_mean"`, `"max"`.
+- `objective.regression_guard_pct` must be greater than or equal to 0.
 - `max_rounds` must be a positive integer, at least 1.
-- Violations produce issues with dimension="numeric" and severity=fail.
+- Violations produce issues with dimension="objective" and severity=fail.
 
 **Check 6 -- Target GPU recognition:**
 `target_gpu` must be one of a recognized set of GPU architectures. The recognized set includes at least: `A100`, `H100`, `A10`, `L4`, `L40`, `T4`, `V100`, `A6000`, `RTX3090`, `RTX4090`. The comparison is case-insensitive. An unrecognized GPU produces an issue with dimension="target_gpu" and severity=warn (warn, not fail, because the set may not be exhaustive and an unrecognized GPU is not necessarily wrong).
@@ -322,10 +358,10 @@ The system prompt instructs the LLM to act as a CUDA kernel optimization specifi
 ```
 
 **Dimension definitions:**
-- **consistency**: Do the fields form a coherent specification? (e.g., do shapes match the op_semantics, does the reference kernel signature match the dtype and shapes?)
-- **specificity**: Is the specification precise enough for an optimization agent to act on? (e.g., are op_semantics unambiguous, is the performance target concrete?)
-- **feasibility**: Is the performance target achievable given the hardware and operation? (Use roofline reasoning: is the target within the theoretical peak for the target GPU and operation type?)
-- **completeness**: Are all fields populated with meaningful content, or are any fields placeholder stubs?
+- **consistency**: Do the fields form a coherent specification? (e.g., do the shape_cases dims match the op_semantics, does the reference kernel signature match the dtype and shapes, is the objective metric consistent with the shape_cases weights?)
+- **specificity**: Is the specification precise enough for an optimization agent to act on? (e.g., are op_semantics unambiguous, is the target_metric_value concrete, do shape_cases cover representative workload points?)
+- **feasibility**: Is the performance target achievable given the hardware and operation? (Use roofline reasoning: is the target_metric_value within the theoretical peak for the target GPU and operation type given the shape_cases?)
+- **completeness**: Are all fields populated with meaningful content, or are any fields placeholder stubs? Do shape_cases cover enough of the workload surface?
 - **kernel_quality**: Is the reference kernel a reasonable starting point? (Does it implement the stated operation, is it syntactically plausible CUDA, would it compile?)
 
 **Response parsing:**
@@ -370,10 +406,10 @@ Interactive mode uses an LLM to extract ProblemSpec fields from conversational u
 11. If validation fails, print the validation errors and ask the user if they want to correct any fields. If yes, go to step 2 with the current field values retained. If no, exit with code 1.
 
 **Field extraction prompt:**
-The system prompt provides the ProblemSpec schema (field names, types, descriptions) and instructs the LLM to return a JSON block with any fields it can extract from the user's message, plus a natural language follow-up. The expected format:
+The system prompt provides the ProblemSpec schema (field names, types, descriptions) and instructs the LLM to return a JSON block with any fields it can extract from the user's message, plus a natural language follow-up. The schema presented to the LLM includes the new structured fields: `shape_cases` (list of ShapeCase with shape_id, dims, weight, correctness_tolerance, profile), `objective` (PerformanceObjective with primary_metric, aggregation, regression_guard_pct), and `target_metric_value`. The expected format:
 
 ```json
-{"extracted": {"op_name": "matmul", "dtype": "float16"}, "follow_up": "What are the matrix dimensions?"}
+{"extracted": {"op_name": "matmul", "dtype": "float16", "shape_cases": [{"shape_id": "4k_square", "dims": [4096, 4096, 4096], "weight": 1.0, "profile": true}]}, "follow_up": "What performance objective and target metric do you want?"}
 ```
 
 Fields already collected in previous turns are included in the prompt context so the LLM does not re-ask for them.
@@ -415,7 +451,7 @@ The module entry point parses CLI arguments, instantiates the LLM client (if nee
 
 4. **Reference kernel resolution.** The resolver examines the `reference_kernel` value. For inline source, it runs the CUDA surface check directly. For `file:///` or `https://` URIs, it fetches the content first, then checks for CUDA markers. If resolution fails, validation returns immediately with the resolution error.
 
-5. **Deterministic checks.** Six check categories run on the spec with the resolved kernel. Each produces zero or more issues. All six run regardless of earlier failures.
+5. **Deterministic checks.** Six check categories run on the spec with the resolved kernel: schema, reference kernel, shape cases, dtype, objective and metric, and target GPU. Each produces zero or more issues. All six run regardless of earlier failures.
 
 6. **LLM judge (if enabled).** The spec is serialized to YAML and sent to the LLM with a reviewer prompt. The response is parsed into five `ValidationIssue` objects. Parse failures trigger one retry, then degrade to an error issue.
 
@@ -459,7 +495,7 @@ The module entry point parses CLI arguments, instantiates the LLM client (if nee
 
 | Success Criteria | Requirements | Scenarios |
 |-----------------|-------------|-----------|
-| SC-1: `--validate` returns is_valid=True for valid YAML, structured ERROR for invalid | REQ-SB-001 | SCN-SB-001-01, SCN-SB-001-02 |
+| SC-1: `--validate` returns is_valid=True for valid YAML, structured ERROR for invalid | REQ-SB-001 | SCN-SB-001-01, SCN-SB-001-02, SCN-SB-001-03, SCN-SB-001-04, SCN-SB-001-05 |
 | SC-2: reference_kernel inline/file/URL all resolve correctly | REQ-SB-002 | SCN-SB-002-01, SCN-SB-002-02, SCN-SB-002-03, SCN-SB-002-04, SCN-SB-002-05 |
 | SC-3: `--no-llm` works without API key (deterministic only) | REQ-SB-003 | SCN-SB-003-01 |
 | SC-4: LLM judge stub returns structured JSON, parsed to ValidationIssue | REQ-SB-004 | SCN-SB-004-01, SCN-SB-004-02, SCN-SB-004-03 |

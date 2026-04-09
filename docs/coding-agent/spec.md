@@ -45,7 +45,7 @@ Every generated CUDA code block must pass through a code validator before being 
 When an LLM call fails to produce a valid CUDA code block (no parseable code, or code fails validation), the Coding Agent must retry that candidate once with error feedback appended to the prompt. If the retry also fails, the candidate slot is skipped. The Coding Agent must never stall or crash due to LLM unavailability or malformed output.
 
 **REQ-CA-007: Candidate Identity and Lineage** [traces SC-7]
-Each returned `KernelCandidate` must have a unique `code_hash` (SHA-256 of the source code, truncated), an `intent_tag` describing the optimization intent, the correct `mode` and `sub_mode` from the directive, and `parent_hash` set to the directive's `base_kernel_hash` (or None for DE_NOVO). No two candidates in the same generation call may share the same `code_hash`.
+Each returned `KernelCandidate` must have a unique `code_hash` (SHA-256 of the source code, truncated), an `intent: CandidateIntent` describing the optimization intent (direction, mode, sub_mode, and rationale), and `parent_hashes` set to `[directive.base_kernel_hash]` for single-parent modes, `directive.parent_candidates` for RECOMBINATION, or `[]` for DE_NOVO. No two candidates in the same generation call may share the same `code_hash`.
 
 **REQ-CA-008: PARAM_SEARCH Variant Generation** [traces SC-2]
 When the directive specifies EXPLOIT mode with PARAM_SEARCH sub-mode, the Coding Agent must generate variants of the current best kernel with specific parameter values drawn from the directive's `search_range`. Each candidate should explore a different point in the parameter space.
@@ -83,8 +83,8 @@ All 142 existing tests must continue to pass after the Coding Agent module is ad
 - WHEN: the Coding Agent generates candidates
 - THEN: 3 KernelCandidate objects are returned
 - AND: each candidate's source_code contains a `__global__` function
-- AND: each candidate has mode = EXPLORE and sub_mode = DE_NOVO
-- AND: each candidate has parent_hash = None
+- AND: each candidate has a CandidateIntent with mode = EXPLORE and sub_mode = DE_NOVO
+- AND: each candidate has parent_hashes = []
 - AND: all 3 code_hash values are distinct
 
 **SCN-CA-001-02: DE_NOVO with LLM producing fewer valid candidates**
@@ -100,9 +100,10 @@ All 142 existing tests must continue to pass after the Coding Agent module is ad
 - AND: num_candidates = 5
 - WHEN: the Coding Agent generates candidates
 - THEN: up to 5 KernelCandidate objects are returned
-- AND: each candidate has parent_hash set to the directive's base_kernel_hash
+- AND: each candidate has parent_hashes = [directive.base_kernel_hash]
 - AND: each candidate has mode = EXPLOIT and sub_mode = LOCAL_REWRITE
-- AND: each candidate's intent_tag references the optimization direction
+- AND: each candidate's intent.direction references the optimization direction
+- AND: each candidate's intent.mode = EXPLOIT and intent.sub_mode = LOCAL_REWRITE
 
 **SCN-CA-002-02: LOCAL_REWRITE without current best source**
 - GIVEN: a directive with mode = EXPLOIT, sub_mode = LOCAL_REWRITE
@@ -287,10 +288,10 @@ All 142 existing tests must continue to pass after the Coding Agent module is ad
 - WHEN: the KernelCandidate is assembled
 - THEN: code_hash equals the first 16 hex characters of SHA-256 of the source code encoded as UTF-8
 
-**SCN-CA-007-02: intent_tag reflects directive direction**
-- GIVEN: a directive with direction = "reduce_register_pressure" and sub_mode = LOCAL_REWRITE
+**SCN-CA-007-02: intent reflects directive direction and mode**
+- GIVEN: a directive with direction = "reduce_register_pressure", mode = EXPLOIT, and sub_mode = LOCAL_REWRITE
 - WHEN: the KernelCandidate is assembled
-- THEN: the intent_tag contains the direction string (e.g., "local_rewrite_reduce_register_pressure_0")
+- THEN: intent is a CandidateIntent with direction = "reduce_register_pressure", mode = EXPLOIT, sub_mode = LOCAL_REWRITE, and rationale = None
 
 **SCN-CA-007-03: Duplicate hash within a generation is deduplicated**
 - GIVEN: the LLM produces identical code for two different candidate slots
@@ -322,9 +323,9 @@ For any combination of direction and mode, the playbook must return at least the
 For any target GPU string (including unrecognized ones), the hardware constraint table must return a valid specification. A lookup failure would prevent prompt construction.
 *Enforcement:* The lookup function returns the matching GPU spec if found, or a conservative default spec if not. The default spec uses the lowest-common-denominator values that are safe for all NVIDIA GPUs (48KB shared memory, 255 registers, 1024 threads, no advanced features).
 
-**INV-CA-006: Candidate mode and sub_mode match the directive**
-Every returned KernelCandidate must have its mode field set to the directive's mode and its sub_mode field set to the directive's sub_mode. These fields are metadata for downstream consumption and must accurately reflect the generation strategy.
-*Enforcement:* Mode and sub_mode are copied from the directive during candidate assembly, not inferred or computed. The assembly step is the single point where KernelCandidate objects are constructed.
+**INV-CA-006: Candidate intent accurately reflects the directive**
+Every returned KernelCandidate must have its `intent` field set to a `CandidateIntent` whose `direction`, `mode`, and `sub_mode` match the directive. These fields are metadata for downstream consumption and must accurately reflect the generation strategy.
+*Enforcement:* The `CandidateIntent` is constructed from the directive's fields during candidate assembly, not inferred or computed. The assembly step is the single point where KernelCandidate objects are constructed.
 
 ---
 
@@ -342,7 +343,7 @@ generate(
 ) -> list[KernelCandidate]
 ```
 
-- `problem_spec`: Defines the target operation (op_name, op_semantics, shapes, dtype), target hardware (target_gpu), performance context (baseline_perf_us, target_perf_us), and the reference kernel. The Coding Agent reads target_gpu for hardware constraint lookup and op_semantics/shapes/dtype for prompt construction.
+- `problem_spec`: Defines the target operation (op_name, op_semantics, shape_cases, dtype), target hardware (target_gpu), performance objective, and the reference kernel. The Coding Agent reads target_gpu for hardware constraint lookup, op_semantics/dtype for prompt construction, and shape_cases (each a ShapeCase with shape_id, dims, weight, correctness_tolerance, and profile flag) for shape information in prompts.
 - `directive`: The strategy directive from the Navigator. The Coding Agent reads mode, direction, sub_mode, num_candidates, base_kernel_hash, tabu, search_range, parent_candidates, gene_map, and hard_constraints.
 - `current_best_source`: The CUDA source code of the current best-performing kernel. Required for EXPLOIT sub-modes (LOCAL_REWRITE, PARAM_SEARCH, PATTERN_APPLY). None on the first round (DE_NOVO) or when no candidate has passed evaluation yet.
 
@@ -589,7 +590,7 @@ The system prompt has four sections, assembled in order:
 
 *EXPLORE / DE_NOVO:*
 - Target operation: `{problem_spec.op_semantics}`
-- Input shapes: `{problem_spec.shapes}`, dtype: `{problem_spec.dtype}`
+- Input shapes: `{[(sc.shape_id, sc.dims, sc.weight) for sc in problem_spec.shape_cases]}`, dtype: `{problem_spec.dtype}`
 - Optimization direction: `{directive.direction}`
 - Task: "Implement a high-performance {problem_spec.op_name} kernel from scratch."
 - Reference kernel (if available): `{problem_spec.reference_kernel}` as a behavioral reference (not to be copied)
@@ -681,10 +682,11 @@ The generation flow describes how a single candidate is generated, from LLM call
 
 **Step 5: Candidate assembly**
 - Compute `code_hash = hashlib.sha256(source_code.encode()).hexdigest()[:16]`.
-- Construct `intent_tag` from the directive's sub_mode (or mode if sub_mode is None) and direction, with the candidate index appended: `"{sub_mode}_{direction}_{index}"`.
-- Set `parent_hash = directive.base_kernel_hash` (None for DE_NOVO).
-- Set `mode = directive.mode`.
-- Set `sub_mode = directive.sub_mode`.
+- Construct `intent = CandidateIntent(direction=directive.direction, mode=directive.mode, sub_mode=effective_sub_mode, rationale=None)`, where `effective_sub_mode` is the directive's sub_mode (which may differ from the original if fallback to DE_NOVO occurred).
+- Set `parent_hashes`:
+  - For DE_NOVO: `parent_hashes = []`
+  - For single-parent modes (LOCAL_REWRITE, PARAM_SEARCH, PATTERN_APPLY): `parent_hashes = [directive.base_kernel_hash]`
+  - For RECOMBINATION: `parent_hashes = directive.parent_candidates`
 - Return the constructed KernelCandidate.
 
 ### 6.6 CodingAgent Class
@@ -747,7 +749,7 @@ This traces two representative paths through the Coding Agent to show how the ge
    - Candidate 2 returns code missing `__launch_bounds__` — this produces a warning (not an error), so the code is accepted.
    - Candidate 4 returns code with unbalanced braces — this is an error. Retry is triggered with the error message appended. The retry produces balanced code that passes validation.
 
-5. **Collect results:** All 5 candidates produce valid KernelCandidate objects. Each has: code_hash = SHA-256 prefix of its source, intent_tag = "local_rewrite_reduce_register_pressure_N", parent_hash = directive.base_kernel_hash, mode = EXPLOIT, sub_mode = LOCAL_REWRITE. All 5 hashes are distinct (the LLM produced different code for each). The list of 5 candidates is returned to the Orchestrator.
+5. **Collect results:** All 5 candidates produce valid KernelCandidate objects. Each has: code_hash = SHA-256 prefix of its source, intent = CandidateIntent(direction="reduce_register_pressure", mode=EXPLOIT, sub_mode=LOCAL_REWRITE, rationale=None), parent_hashes = [directive.base_kernel_hash]. All 5 hashes are distinct (the LLM produced different code for each). The list of 5 candidates is returned to the Orchestrator.
 
 ### Path B: EXPLORE / DE_NOVO — Initial Kernel Generation on H100
 
@@ -757,14 +759,14 @@ This traces two representative paths through the Coding Agent to show how the ge
 
 2. **Build system prompt:** CUDA expert role, code standards, H100 constraints (228KB smem, TMA available, FP8 available, full TC suite), playbook Layers 1, 5-Hopper, and 6-reduction.
 
-3. **Build user prompts:** DE_NOVO prompts are constructed. Each includes the operation semantics (e.g., "sum reduction over the last dimension of a tensor"), shapes, dtype, and the reference kernel as behavioral reference. Variation hints encourage structural diversity (e.g., "Use warp shuffle primitives", "Use shared memory tree reduction", "Try a persistent kernel approach").
+3. **Build user prompts:** DE_NOVO prompts are constructed. Each includes the operation semantics (e.g., "sum reduction over the last dimension of a tensor"), shape_cases (with their IDs, dims, and weights), dtype, and the reference kernel as behavioral reference. Variation hints encourage structural diversity (e.g., "Use warp shuffle primitives", "Use shared memory tree reduction", "Try a persistent kernel approach").
 
 4. **Generate concurrently:** Three LLM calls are dispatched.
    - Candidate 0 returns a valid warp-shuffle reduction kernel. Passes all checks.
    - Candidate 1 returns code that uses `std::vector` (host-only API). Error detected. Retry is triggered with "Host-only API detected: std::. Kernel code must not contain host-side calls." The retry returns clean kernel code. Passes validation.
    - Candidate 2's LLM call times out (network error). Exception is caught. Retry is attempted. The retry also times out. Candidate 2 is skipped.
 
-5. **Collect results:** 2 valid candidates are returned. Each has parent_hash = None (DE_NOVO), mode = EXPLORE, sub_mode = DE_NOVO. The Orchestrator receives 2 candidates instead of the requested 3, but this is a valid outcome — the system continues with what was produced.
+5. **Collect results:** 2 valid candidates are returned. Each has parent_hashes = [] (DE_NOVO), intent = CandidateIntent(direction="initial_exploration", mode=EXPLORE, sub_mode=DE_NOVO, rationale=None). The Orchestrator receives 2 candidates instead of the requested 3, but this is a valid outcome — the system continues with what was produced.
 
 ---
 
@@ -793,6 +795,6 @@ This traces two representative paths through the Coding Agent to show how the ge
 | SC-4: GPU constraint table correct for A100/H100 | REQ-CA-004, REQ-CA-011 | SCN-CA-004-01, SCN-CA-004-02, SCN-CA-004-03 |
 | SC-5: Code validator catches missing `__global__`, unbalanced brackets | REQ-CA-005 | SCN-CA-005-01, SCN-CA-005-02, SCN-CA-005-03, SCN-CA-005-04, SCN-CA-005-05, SCN-CA-005-06, SCN-CA-005-07, SCN-CA-005-08 |
 | SC-6: LLM failure -> retry -> skip candidate | REQ-CA-006 | SCN-CA-006-01, SCN-CA-006-02, SCN-CA-006-03, SCN-CA-006-04, SCN-CA-006-05 |
-| SC-7: Each KernelCandidate has unique hash, correct intent_tag, parent lineage | REQ-CA-007 | SCN-CA-007-01, SCN-CA-007-02, SCN-CA-007-03 |
+| SC-7: Each KernelCandidate has unique hash, correct intent (CandidateIntent), parent lineage (parent_hashes) | REQ-CA-007 | SCN-CA-007-01, SCN-CA-007-02, SCN-CA-007-03 |
 | SC-8: Existing 142 tests pass | QG-CA-003 | (verified by running existing test suite after module addition) |
 | SC-9: mypy --strict and ruff check pass | QG-CA-001, QG-CA-002 | (verified by CI tooling) |

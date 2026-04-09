@@ -76,7 +76,7 @@ All source code must pass `ruff check` with no errors.
 
 **SCN-NAV-002-01: Plateau after N exploit rounds forces EXPLORE**
 - GIVEN: the last 3 rounds were all EXPLOIT mode
-- AND: the average performance improvement across those rounds is below the plateau threshold (< 2%)
+- AND: the average relative gain across those rounds is below the plateau threshold (e.g., avg_delta < 0.02, meaning less than 2% relative improvement)
 - WHEN: the Navigator is asked for a decision
 - THEN: the directive has mode = EXPLORE
 - AND: the directive has reason referencing plateau detection
@@ -89,7 +89,7 @@ All source code must pass `ruff check` with no errors.
 - AND: the decision proceeds to subsequent gates or LLM reasoning
 
 **SCN-NAV-003-01: Near target forces EXPLOIT**
-- GIVEN: the current global best latency is within 95% of the target (i.e., best_latency <= target_perf_us / 0.95, equivalently the performance ratio global_best / target >= 0.95 when lower is better)
+- GIVEN: the incumbent's objective score value is within the configured threshold of the target metric value (i.e., `incumbent.objective_score.value <= target_metric_value / target_threshold`; for example, if target = 1.0us, threshold = 0.95, then incumbent score <= 1.053us triggers this gate)
 - AND: the optimization is not on the first round
 - AND: no higher-priority gate matches
 - WHEN: the Navigator is asked for a decision
@@ -97,14 +97,14 @@ All source code must pass `ruff check` with no errors.
 - AND: the directive has reason referencing near-target refinement
 
 **SCN-NAV-004-01: New bottleneck triggers LLM reasoning**
-- GIVEN: the latest round's profiling produces a bottleneck tag that does not appear in any prior round's bottleneck history
+- GIVEN: the latest bottleneck assessment's primary tag does not appear as the primary tag in any prior round's bottleneck history
 - AND: no higher-priority gate matches (not cold start, not plateau, not near-target)
 - WHEN: the Navigator is asked for a decision
 - THEN: Phase 3 LLM reasoning is invoked (not a deterministic gate decision)
 
 **SCN-NAV-005-01: Exhausted direction forces EXPLORE**
-- GIVEN: the same bottleneck tag has appeared for K = 3 consecutive rounds (stable bottleneck)
-- AND: the optimization direction addressing that bottleneck has been attempted M = 3 or more times
+- GIVEN: the same primary bottleneck tag has appeared in the last K = 3 consecutive bottleneck assessments (stable bottleneck)
+- AND: the optimization direction addressing that bottleneck has been attempted M = 3 or more times (counted from attempt records)
 - AND: no higher-priority gate matches
 - WHEN: the Navigator is asked for a decision
 - THEN: the direction is marked as exhausted
@@ -112,8 +112,8 @@ All source code must pass `ruff check` with no errors.
 - AND: the directive has reason referencing exhausted direction
 
 **SCN-NAV-005-02: Stable bottleneck with fewer attempts proceeds to LLM**
-- GIVEN: the same bottleneck tag has appeared for K consecutive rounds
-- AND: the direction has been attempted fewer than M times
+- GIVEN: the same primary bottleneck tag has appeared for K consecutive assessments
+- AND: the direction has been attempted fewer than M times (counted from attempt records)
 - WHEN: the Navigator is asked for a decision
 - THEN: the exhausted gate does NOT fire
 - AND: the decision proceeds to LLM reasoning
@@ -123,7 +123,7 @@ All source code must pass `ruff check` with no errors.
 **SCN-NAV-006-01: LLM returns valid decision**
 - GIVEN: no deterministic gate matched (ambiguous signal)
 - WHEN: the LLM receives the assembled context and returns a well-formed JSON response
-- AND: the chosen direction is not in the tabu list
+- AND: the chosen direction is not blocked by any active tabu entry for the current base kernel
 - AND: the chosen direction is not in the exhausted set
 - AND: confidence is at or above the minimum threshold
 - THEN: the LLM decision is accepted and used for directive assembly
@@ -143,7 +143,7 @@ All source code must pass `ruff check` with no errors.
 
 **SCN-NAV-006-04: LLM suggests tabu direction triggers retry**
 - GIVEN: the LLM returns a well-formed response
-- AND: the chosen direction is in the tabu list
+- AND: the chosen direction combined with the current base kernel hash matches an active tabu entry (matching on base_kernel_hash and direction, with the entry not yet expired)
 - WHEN: validation detects the tabu violation
 - THEN: this is treated as a validation failure and retry/fallback logic applies
 
@@ -156,9 +156,9 @@ All source code must pass `ruff check` with no errors.
 ### UCB1 Scenarios
 
 **SCN-NAV-007-01: UCB1 selects least-explored direction**
-- GIVEN: direction A has been visited 5 times with average gain 3%
-- AND: direction B has been visited 1 time with average gain 5%
-- AND: direction C has been visited 5 times with average gain 4%
+- GIVEN: direction A has been visited 5 times with average relative gain 0.03 (3%)
+- AND: direction B has been visited 1 time with average relative gain 0.05 (5%)
+- AND: direction C has been visited 5 times with average relative gain 0.04 (4%)
 - WHEN: UCB1 scores are computed with C = 1.414 and total_rounds = 11
 - THEN: direction B has the highest UCB1 score (exploration bonus dominates)
 - AND: direction B is selected
@@ -179,16 +179,16 @@ All source code must pass `ruff check` with no errors.
 
 **SCN-NAV-008-01: Tabu filter on same base kernel**
 - GIVEN: the directive direction is "reduce_register_pressure"
-- AND: the tabu list contains an entry with the same (base_kernel_hash, "reduce_register_pressure") pair from a recent round
+- AND: the tabu entries contain a TabuEntry with base_kernel_hash matching the current incumbent's kernel hash, direction = "reduce_register_pressure", and expires_after_round >= current_round
 - WHEN: the tabu filter runs in Phase 4
 - THEN: the direction is flagged as tabu for that specific base kernel
 - AND: either a different direction is substituted or the base kernel is changed
 
 **SCN-NAV-008-02: Same direction on different base kernel is allowed**
-- GIVEN: the tabu list contains ("hash_A", "reduce_register_pressure")
-- AND: the current base kernel hash is "hash_B"
+- GIVEN: the tabu entries contain a TabuEntry with base_kernel_hash = "hash_A" and direction = "reduce_register_pressure"
+- AND: the current incumbent's kernel hash is "hash_B"
 - WHEN: the directive assembles with direction "reduce_register_pressure" on hash_B
-- THEN: the tabu filter does NOT block this combination
+- THEN: the tabu filter does NOT block this combination (base_kernel_hash does not match)
 - AND: the directive proceeds with the direction
 
 **SCN-NAV-008-03: Exploit directive candidate count**
@@ -204,9 +204,9 @@ All source code must pass `ruff check` with no errors.
 **SCN-NAV-008-05: Complete directive fields for EXPLOIT mode**
 - GIVEN: the mode is EXPLOIT and the direction targets a specific bottleneck
 - WHEN: the directive is assembled
-- THEN: base_kernel_hash is set to the current global best hash
+- THEN: base_kernel_hash is set to the incumbent's kernel hash
 - AND: sub_mode is set to one of PARAM_SEARCH, LOCAL_REWRITE, or PATTERN_APPLY
-- AND: tabu contains the current tabu list entries
+- AND: tabu contains the currently active TabuEntry records (those not yet expired)
 - AND: all required fields are populated
 
 **SCN-NAV-008-06: Complete directive fields for EXPLORE DE_NOVO mode**
@@ -243,9 +243,9 @@ If the LLM is unavailable, returns unparseable output, or returns an invalid dec
 Once a direction is marked as exhausted (stable bottleneck + M attempts exceeded), it must not be selected by the LLM path (validated during LLM output checking) or by UCB1 (excluded from the candidate set). Exhausted status persists for the remainder of the optimization run.
 *Enforcement:* The LLM validation step checks `direction not in exhausted_set`. UCB1 scoring excludes directions in the exhausted set before computing scores. The exhausted set is computed from the optimization state and is append-only within a run.
 
-**INV-NAV-005: Tabu filtering matches on (base_kernel_hash, intent_tag) pairs**
-Tabu filtering does not block a direction globally. It blocks the specific combination of a direction applied to the same base kernel within the tabu window. The same direction applied to a different base kernel is permitted.
-*Enforcement:* The tabu check compares the candidate (hash, tag) pair against entries in the tabu list. Only exact pair matches trigger tabu blocking.
+**INV-NAV-005: Tabu filtering matches on typed TabuEntry fields**
+Tabu filtering does not block a direction globally. It blocks the specific combination of a direction applied to the same base kernel, checked via typed `TabuEntry(base_kernel_hash, direction, sub_mode)` records. The same direction applied to a different base kernel is permitted. Entries expire deterministically: a tabu entry is active only when `expires_after_round >= current_round`.
+*Enforcement:* The tabu check matches the candidate's (base_kernel_hash, direction) against `TabuEntry` records in the optimization state, considering only entries where `expires_after_round >= current_round`. Only exact matches on both `base_kernel_hash` and `direction` trigger tabu blocking.
 
 **INV-NAV-006: Every StrategyDirective has a valid mode and non-empty reason**
 The Navigator must never return a directive with an unset mode or an empty reason string. The reason must explain the decision path taken (gate name, LLM reasoning summary, or UCB1 fallback).
@@ -268,9 +268,9 @@ decide(
 ) -> StrategyDirective
 ```
 
-- `problem_spec`: Defines the target operation, hardware, performance baseline/target, and tolerance. The Navigator reads `target_perf_us` and `baseline_perf_us` for near-target gate computation.
-- `optimization_state`: Full accumulated state — rounds history, tabu list, bottleneck history, global best, current round counter. This is the Navigator's primary input for signal computation.
-- `round_summary`: Compressed summary of the most recent round. None on the first round. Used for quick access to the latest round's mode, direction, and improvement delta.
+- `problem_spec`: Defines the target operation, hardware, shape cases, performance objective, and target metric value. The Navigator reads `target_metric_value` and the `objective` for near-target gate computation.
+- `optimization_state`: Full accumulated state — rounds history, typed attempt records, typed tabu entries, bottleneck assessments with evidence, baseline artifact, incumbent artifact, and current round counter. This is the Navigator's primary input for signal computation.
+- `round_summary`: Compressed summary of the most recent round. None on the first round. Used for quick access to the latest round's mode, direction, relative gain, and objective score.
 - `cross_analysis`: Output from cross-candidate analysis of the previous round. None on the first round or when analysis was skipped. Used by LLM reasoning context and for populating recombination fields.
 
 ### LLM Client Protocol (dependency)
@@ -293,7 +293,7 @@ StrategyDirective:
     reason: str                                   # decision rationale
     base_kernel_hash: str | None                  # kernel to mutate (None for de novo)
     num_candidates: int                           # how many candidates to generate
-    tabu: list[str]                               # current tabu list for Coding Agent
+    tabu: list[TabuEntry]                           # current active tabu entries for Coding Agent
     sub_mode: SubMode | None = None               # finer strategy classification
     parent_candidates: list[str] | None = None    # kernel hashes for recombination
     gene_map: dict[str, str] | None = None        # code section mapping for recombination
@@ -311,7 +311,7 @@ NavigatorConfig:
     plateau_rounds: int = 3                  # (N) consecutive exploit rounds for plateau
     stable_rounds: int = 3                   # (K) rounds with same bottleneck for stability
     max_direction_attempts: int = 3          # (M) attempts before marking exhausted
-    tabu_window: int = 5                     # (W) rounds to keep entries in tabu
+    tabu_window: int = 5                     # (W) rounds before a tabu entry expires
     target_threshold: float = 0.95           # perf ratio triggering exploit-only
     llm_context_budget: int = 2048           # max tokens for LLM context
     llm_confidence_min: str = "medium"       # minimum LLM confidence to accept
@@ -323,13 +323,13 @@ NavigatorConfig:
 ### Internal Types (Navigator-private)
 
 **DerivedSignals** — output of Phase 1 signal computation:
-- `avg_delta: float` — mean performance improvement over last N rounds (0.0 when no history)
+- `avg_delta: float` — mean relative performance gain over last N rounds (0.0 when no history). This is a ratio (e.g., 0.02 = 2% gain), not an absolute value.
 - `is_plateau: bool` — avg_delta < plateau_threshold
 - `is_regress: bool` — avg_delta < 0
-- `stable_bottleneck: str | None` — the bottleneck tag if it has been the same for K consecutive rounds, else None
-- `new_bottleneck: str | None` — the latest bottleneck tag if it was never seen before, else None
+- `stable_bottleneck: str | None` — the primary bottleneck tag if it has been the same for K consecutive rounds, else None. Derived from `BottleneckAssessment.primary_tag`.
+- `new_bottleneck: str | None` — the latest primary bottleneck tag if it was never seen before, else None. Derived from `BottleneckAssessment.primary_tag`.
 - `consecutive_exploit_rounds: int` — count of most recent consecutive rounds with mode = EXPLOIT
-- `direction_attempt_counts: dict[str, int]` — mapping from direction tag to number of times it has been attempted
+- `direction_attempt_counts: dict[str, int]` — mapping from direction tag to number of times it has been attempted. Computed from `AttemptRecord` history, not from round summaries.
 - `exhausted_directions: set[str]` — directions that meet the exhaustion criteria
 
 **GateResult** — output of a matched gate in Phase 2:
@@ -347,8 +347,8 @@ NavigatorConfig:
 
 **DirectionStats** — per-direction performance tracking for UCB1:
 - `direction: str` — direction tag
-- `visits: int` — number of rounds that used this direction
-- `total_perf_gain: float` — sum of improvement_over_prev_best for rounds using this direction
+- `visits: int` — number of attempts that used this direction. Computed from `AttemptRecord` history.
+- `total_perf_gain: float` — sum of `rel_gain_vs_prev_best` for rounds using this direction (None treated as 0.0). This is a sum of relative gains (ratios), not absolute microsecond deltas.
 - `avg_perf_gain: float` — total_perf_gain / visits (0.0 when visits = 0)
 
 ---
@@ -359,9 +359,9 @@ NavigatorConfig:
 
 Phase 1 is a deterministic, side-effect-free computation that derives decision signals from the accumulated optimization state. It runs on every invocation of `decide()`.
 
-**avg_delta (improvement trend):**
-- Collect the `improvement_over_prev_best` values from the most recent `plateau_rounds` (N) rounds in the rounds list.
-- If a round has `improvement_over_prev_best = None` (no improvement that round), treat it as 0.0 for the purpose of the average.
+**avg_delta (relative improvement trend):**
+- Collect the `rel_gain_vs_prev_best` values from the most recent `plateau_rounds` (N) rounds in the rounds list. This value is a relative gain (ratio), e.g., 0.02 = 2% improvement.
+- If a round has `rel_gain_vs_prev_best = None` (no improvement that round), treat it as 0.0 for the purpose of the average.
 - `avg_delta = sum(deltas) / len(deltas)`.
 - If the rounds list is empty (round 0), avg_delta = 0.0.
 
@@ -374,19 +374,17 @@ Phase 1 is a deterministic, side-effect-free computation that derives decision s
 - This signal is informational — it is included in the LLM context to help the LLM reason about whether to change direction. It does not directly trigger any gate.
 
 **stable_bottleneck:**
-- Examine the last `stable_rounds` (K) entries in `bottleneck_history`.
-- Each entry is a list of bottleneck tags for that round.
-- If all K entries share at least one common bottleneck tag (intersection of the K lists is non-empty), that tag is the stable bottleneck.
-- If multiple tags are common, take the one that appears most frequently across all K lists.
-- If fewer than K rounds of history exist, stable_bottleneck = None.
-- If any of the K lists is empty (no profiling data that round), stable_bottleneck = None.
+- Examine the last `stable_rounds` (K) entries in `bottleneck_history`. Each entry is a `BottleneckAssessment` with a `primary_tag`, `tags`, `evidence`, and `rule_trace`.
+- Compare the `primary_tag` across the K most recent assessments.
+- If all K assessments have the same `primary_tag` (and it is not None), that tag is the stable bottleneck.
+- If fewer than K assessments exist, stable_bottleneck = None.
+- If any of the K assessments has `primary_tag = None` (no profiling data that round), stable_bottleneck = None.
 
 **new_bottleneck:**
-- Take the bottleneck tags from the most recent round's history.
-- For each tag, check whether it appears in any prior round's bottleneck history.
-- If a tag is found that has never appeared before, new_bottleneck = that tag.
-- If multiple tags are new, take the first one encountered.
-- If the latest round has no bottleneck tags, or all tags have been seen before, new_bottleneck = None.
+- Take the `primary_tag` from the most recent `BottleneckAssessment` in `bottleneck_history`.
+- Check whether that `primary_tag` appears as the `primary_tag` in any prior assessment in the bottleneck history.
+- If the tag has never appeared as a primary tag before, new_bottleneck = that tag.
+- If the latest assessment has `primary_tag = None`, or the tag has been seen before, new_bottleneck = None.
 - On round 0 (no history at all), new_bottleneck = None.
 
 **consecutive_exploit_rounds:**
@@ -396,8 +394,8 @@ Phase 1 is a deterministic, side-effect-free computation that derives decision s
 - On round 0, the count is 0.
 
 **direction_attempt_counts:**
-- Build a mapping from direction string to the number of rounds that used that direction.
-- Source: iterate over all round summaries in the optimization state, counting occurrences of each `direction` value.
+- Build a mapping from direction string to the number of attempts that used that direction.
+- Source: iterate over all `AttemptRecord` entries in `optimization_state.attempts`, counting occurrences of each `direction` value. This uses typed attempt records rather than round summaries, which provides a more accurate count since a single round may produce multiple attempts with different directions.
 
 **exhausted_directions:**
 - For each direction where `direction_attempt_counts[direction] >= max_direction_attempts`, check whether the direction corresponds to a stable bottleneck (i.e., the direction was targeting a bottleneck that has been stable for K rounds).
@@ -420,9 +418,9 @@ Phase 2 evaluates five deterministic gates in strict priority order. The first g
 - Rationale: Local search space is depleted. The system must try a structural change to find a new basin.
 
 **Gate 3: Near Target**
-- Condition: `optimization_state.global_best_latency_us is not None` AND `optimization_state.global_best_latency_us <= problem_spec.target_perf_us / target_threshold`
-- Explanation: This checks whether the best latency is within the "near target" zone. Since lower latency is better, and `target_threshold` = 0.95, the condition `best_latency <= target / 0.95` means the best is within 95% of the target performance. For example, if target = 1.0us and threshold = 0.95, then any best latency <= 1.053us triggers this gate.
-- Output: GateResult(mode=EXPLOIT, direction=<current bottleneck tag or "fine_tune">, reason="Near target: current best is within {pct:.1%} of target, fine-tuning only", sub_mode=PARAM_SEARCH)
+- Condition: `optimization_state.incumbent is not None` AND `optimization_state.incumbent.objective_score.value <= problem_spec.target_metric_value / target_threshold`
+- Explanation: This checks whether the incumbent's objective score is within the "near target" zone. Since lower objective score is better (for latency-based objectives), and `target_threshold` = 0.95, the condition `incumbent_score <= target / 0.95` means the incumbent is within 95% of the target performance. For example, if target_metric_value = 1.0us and threshold = 0.95, then any incumbent score <= 1.053us triggers this gate.
+- Output: GateResult(mode=EXPLOIT, direction=<current bottleneck tag or "fine_tune">, reason="Near target: incumbent is within {pct:.1%} of target, fine-tuning only", sub_mode=PARAM_SEARCH)
 - Rationale: Structural changes risk regression when the kernel is nearly optimal. Only fine-grained parameter tuning is safe.
 
 **Gate 4: New Bottleneck**
@@ -453,13 +451,13 @@ The system prompt is static (not regenerated per call).
 
 **User Prompt Construction:**
 The user prompt is assembled from the optimization state, capped at `llm_context_budget` tokens. It includes, in priority order (if budget permits):
-1. Current bottleneck tags from the most recent round
-2. Performance trend: avg_delta, is_plateau, is_regress
-3. Top-3 candidates by latency with their performance numbers
-4. Last round's mode, direction, and improvement delta
+1. Current bottleneck assessment: `primary_tag` and `evidence` (quantitative metrics backing the bottleneck label) from the most recent `BottleneckAssessment`
+2. Performance trend: avg_delta (relative gain), is_plateau, is_regress
+3. Top-3 candidates by objective score with their performance numbers
+4. Last round's mode, direction, and `rel_gain_vs_prev_best`
 5. List of exhausted directions
 6. Cross-candidate analysis insights and recombination suggestions (if available)
-7. Search tree summary (direction history with visit counts)
+7. Search tree summary (direction history with visit counts, computed from attempt records)
 
 Items are included in the above priority order. If the budget is exceeded, lower-priority items are truncated or omitted.
 
@@ -478,7 +476,7 @@ Items are included in the above priority order. If the budget is exceeded, lower
 1. The response is valid JSON containing exactly the five expected fields.
 2. `mode` is one of "exploit" or "explore" (case-insensitive).
 3. `direction` is a non-empty string.
-4. `direction` is not in the tabu list for the current base kernel.
+4. `direction` is not blocked by any active `TabuEntry` for the current base kernel (matching on `base_kernel_hash` and `direction` where `expires_after_round >= current_round`).
 5. `direction` is not in the exhausted directions set.
 6. `sub_mode`, if non-null, is one of "de_novo" or "recombination" (for explore mode) or "param_search", "local_rewrite", "pattern_apply" (for exploit mode).
 7. `confidence` is one of "high", "medium", "low".
@@ -501,15 +499,15 @@ UCB1(direction) = avg_perf_gain(direction) + C * sqrt(ln(total_rounds) / visits(
 ```
 
 Where:
-- `avg_perf_gain(direction)` = mean of `improvement_over_prev_best` across all rounds that used this direction (treating None as 0.0)
+- `avg_perf_gain(direction)` = mean of `rel_gain_vs_prev_best` across all rounds that used this direction (treating None as 0.0). This is a relative gain (ratio), not an absolute microsecond delta.
 - `C` = `ucb1_c` configuration parameter (default 1.414 = sqrt(2))
 - `total_rounds` = number of completed rounds (optimization_state.current_round)
-- `visits(direction)` = number of rounds that used this direction
+- `visits(direction)` = number of attempts that used this direction (from AttemptRecord history)
 
 **Direction Statistics:**
-Direction statistics are computed from the optimization state's rounds list. For each unique direction in the round summaries, compute:
-- `visits`: count of rounds with that direction
-- `total_perf_gain`: sum of `improvement_over_prev_best` (None treated as 0.0)
+Direction statistics are computed from the optimization state's attempt records (`optimization_state.attempts`). For each unique direction across all `AttemptRecord` entries, compute:
+- `visits`: count of attempt records with that direction
+- `total_perf_gain`: for each attempt's round, take the corresponding `RoundSummary.rel_gain_vs_prev_best` (None treated as 0.0) and sum across all attempts with that direction. This uses relative gains (ratios), not absolute microsecond deltas.
 - `avg_perf_gain`: total_perf_gain / visits
 
 **Edge Cases:**
@@ -522,7 +520,7 @@ Direction statistics are computed from the optimization state's rounds list. For
 
 **Available Directions:**
 The set of candidate directions for UCB1 is derived from two sources:
-1. All directions that have appeared in the round history
+1. All directions that have appeared in the attempt record history
 2. The current bottleneck tags (which may suggest new directions)
 
 Exhausted directions are excluded from the candidate set (unless all are exhausted, per the edge case above).
@@ -543,8 +541,8 @@ Phase 4 takes the decision from Phase 2 (gate) or Phase 3 (LLM/UCB1) and assembl
 - `sub_mode`: from the gate result or LLM decision; may be None
 
 **Step 2: Apply tabu filter**
-- Check whether the (base_kernel_hash, direction) pair exists in the tabu list within the tabu window (last W rounds).
-- The tabu list in OptimizationState stores intent_tags from recent rounds. The filter checks whether the proposed direction, when combined with the current base kernel hash, was recently tried.
+- Check whether the (base_kernel_hash, direction) pair matches any active `TabuEntry` in `optimization_state.tabu_entries`. An entry is active when `expires_after_round >= optimization_state.current_round`.
+- The match is on `TabuEntry.base_kernel_hash` and `TabuEntry.direction`. Sub-mode may also be checked for finer-grained tabu control.
 - If the direction is tabu for the current base kernel: attempt to substitute a different direction from the available set (using UCB1 scoring among non-tabu alternatives). If no alternative is available, proceed with the tabu direction and note it in the reason.
 
 **Step 3: Determine candidate count**
@@ -552,7 +550,7 @@ Phase 4 takes the decision from Phase 2 (gate) or Phase 3 (LLM/UCB1) and assembl
 - If mode is EXPLORE: num_candidates = `explore_candidates` (default 3)
 
 **Step 4: Set base kernel hash**
-- If mode is EXPLOIT: base_kernel_hash = optimization_state.global_best_hash
+- If mode is EXPLOIT: base_kernel_hash = optimization_state.incumbent.kernel_hash
 - If mode is EXPLORE and sub_mode is DE_NOVO: base_kernel_hash = None
 - If mode is EXPLORE and sub_mode is RECOMBINATION: base_kernel_hash = None (parents are specified separately)
 
@@ -575,8 +573,8 @@ For EXPLORE RECOMBINATION mode:
 - `search_range`: None
 - `hard_constraints`: Same as EXPLOIT
 
-**Step 6: Assemble tabu list for output**
-- The `tabu` field on the output StrategyDirective contains the intent_tags from the optimization state's tabu list, windowed to the last `tabu_window` rounds.
+**Step 6: Assemble tabu entries for output**
+- The `tabu` field on the output StrategyDirective contains the active `TabuEntry` records from the optimization state — those where `expires_after_round >= current_round`. Expired entries are excluded.
 
 **Step 7: Construct and return StrategyDirective**
 All fields are populated. The directive is returned to the caller (the main `decide()` method), which returns it to the Orchestrator.
@@ -618,7 +616,7 @@ This traces a multi-round optimization sequence to show how the Navigator behave
 
 **Round 0 — Cold Start**
 
-Trigger: The Orchestrator calls `decide()` with an empty optimization state (current_round=0, no rounds, no bottleneck history).
+Trigger: The Orchestrator calls `decide()` with an optimization state seeded from the measured baseline (current_round=0, no rounds, no bottleneck history, incumbent = baseline artifact).
 
 1. Phase 1 computes signals: avg_delta=0.0, is_plateau=False, is_regress=False, stable_bottleneck=None, new_bottleneck=None, consecutive_exploit_rounds=0, direction_attempt_counts={}, exhausted_directions={}.
 2. Phase 2 checks gates: Gate 1 fires (current_round==0). Returns EXPLORE / DE_NOVO / "cold start".
@@ -628,19 +626,19 @@ Trigger: The Orchestrator calls `decide()` with an empty optimization state (cur
 
 **Rounds 1-3 — Exploit Improving**
 
-Trigger: Round 1 begins. The Orchestrator passes state with one round of history, global_best set, bottleneck_history populated.
+Trigger: Round 1 begins. The Orchestrator passes state with one round of history, incumbent updated, bottleneck_history populated with the first BottleneckAssessment.
 
-1. Phase 1: avg_delta is positive (improvement found in round 0), is_plateau=False, consecutive_exploit_rounds=0 (round 0 was EXPLORE).
-2. Phase 2: Gate 1 skipped (round > 0). Gate 2 skipped (not plateau, consecutive exploit is 0). Gate 3: check near-target — best latency is far from target, so skipped. Gate 4: check new bottleneck — bottleneck tags are new (first round had some), but since round 0 was EXPLORE with de novo, the history context varies. If a new bottleneck is detected, proceed to Phase 3. Otherwise, no gate matches → Phase 3.
-3. Phase 3: LLM receives context about the single round of history, bottleneck tags, and performance numbers. LLM returns {mode: "exploit", direction: "reduce_memory_bandwidth", confidence: "high"}. Validation passes.
-4. Phase 4 assembles directive: mode=EXPLOIT, direction="reduce_memory_bandwidth", base_kernel_hash=<global_best_hash>, num_candidates=5, sub_mode=LOCAL_REWRITE.
-5. Rounds 2 and 3 follow similarly, with the LLM or gates guiding exploitation of the current best kernel.
+1. Phase 1: avg_delta is positive (relative gain found in round 0), is_plateau=False, consecutive_exploit_rounds=0 (round 0 was EXPLORE).
+2. Phase 2: Gate 1 skipped (round > 0). Gate 2 skipped (not plateau, consecutive exploit is 0). Gate 3: check near-target — incumbent objective score is far from target, so skipped. Gate 4: check new bottleneck — the primary_tag is new (first assessment), but since round 0 was EXPLORE with de novo, the history context varies. If a new bottleneck is detected, proceed to Phase 3. Otherwise, no gate matches -> Phase 3.
+3. Phase 3: LLM receives context about the single round of history, bottleneck primary_tag with evidence, and relative performance numbers. LLM returns {mode: "exploit", direction: "reduce_memory_bandwidth", confidence: "high"}. Validation passes (direction is not in any active TabuEntry for the incumbent's kernel hash).
+4. Phase 4 assembles directive: mode=EXPLOIT, direction="reduce_memory_bandwidth", base_kernel_hash=<incumbent.kernel_hash>, num_candidates=5, sub_mode=LOCAL_REWRITE.
+5. Rounds 2 and 3 follow similarly, with the LLM or gates guiding exploitation of the incumbent kernel.
 
 **Round 4 — Plateau Detected**
 
-Trigger: Rounds 1-3 were all EXPLOIT mode with small improvements (avg_delta < 2%).
+Trigger: Rounds 1-3 were all EXPLOIT mode with small relative gains (avg_delta < 0.02, i.e., less than 2% relative improvement).
 
-1. Phase 1: avg_delta=0.015 (1.5%, below 2% threshold), consecutive_exploit_rounds=3 (rounds 1-3 were exploit). is_plateau=True.
+1. Phase 1: avg_delta=0.015 (1.5% relative gain, below 0.02 threshold), consecutive_exploit_rounds=3 (rounds 1-3 were exploit). is_plateau=True.
 2. Phase 2: Gate 1 skipped (round > 0). Gate 2 fires: is_plateau AND consecutive_exploit_rounds >= 3. Returns EXPLORE / "plateau detected".
 3. Phase 3 skipped.
 4. Phase 4: mode=EXPLORE, direction="structural_change", num_candidates=3.
@@ -648,9 +646,9 @@ Trigger: Rounds 1-3 were all EXPLOIT mode with small improvements (avg_delta < 2
 
 **Round 7 — Exhausted Direction**
 
-Trigger: Rounds 5-7 all had the same stable bottleneck "low_occupancy_regs" and used the direction "reduce_register_pressure" 3 times.
+Trigger: Rounds 5-7 all had the same stable bottleneck primary_tag "low_occupancy_regs" and the direction "reduce_register_pressure" appears 3 times in the attempt records.
 
-1. Phase 1: stable_bottleneck="low_occupancy_regs" (same tag for K=3 rounds), direction_attempt_counts["reduce_register_pressure"]=3, exhausted_directions={"reduce_register_pressure"}.
+1. Phase 1: stable_bottleneck="low_occupancy_regs" (same primary_tag for K=3 consecutive assessments), direction_attempt_counts["reduce_register_pressure"]=3 (from AttemptRecord history), exhausted_directions={"reduce_register_pressure"}.
 2. Phase 2: Gate 1 skipped. Gate 2 skipped (not plateau — some rounds were EXPLORE). Gate 3 skipped (not near target). Gate 4 skipped (bottleneck is stable, not new). Gate 5 fires: stable_bottleneck is not None AND it is in exhausted_directions. Returns EXPLORE / "direction exhausted".
 3. Phase 3 skipped.
 4. Phase 4: mode=EXPLORE, direction="structural_change", num_candidates=3.
@@ -666,12 +664,12 @@ Trigger: No deterministic gate matches. LLM is called but returns malformed JSON
 
 **Round 15 — Near Target**
 
-Trigger: Global best latency has reached within 95% of target.
+Trigger: Incumbent's objective score has reached within 95% of the target metric value.
 
 1. Phase 1 computes signals normally.
-2. Phase 2: Gate 1 skipped. Gate 2 skipped (no plateau). Gate 3 fires: global_best_latency <= target_perf_us / 0.95. Returns EXPLOIT / "near target".
+2. Phase 2: Gate 1 skipped. Gate 2 skipped (no plateau). Gate 3 fires: incumbent.objective_score.value <= target_metric_value / 0.95. Returns EXPLOIT / "near target".
 3. Phase 3 skipped.
-4. Phase 4: mode=EXPLOIT, sub_mode=PARAM_SEARCH, direction="fine_tune", base_kernel_hash=<global_best>, num_candidates=5.
+4. Phase 4: mode=EXPLOIT, sub_mode=PARAM_SEARCH, direction="fine_tune", base_kernel_hash=<incumbent.kernel_hash>, num_candidates=5.
 5. The system performs only safe parameter tuning to close the remaining gap.
 
 ---
@@ -683,7 +681,7 @@ Trigger: Global best latency has reached within 95% of target.
 | 1 | Division by zero in signal computation | Computing avg_delta without checking for empty rounds list | Crash on round 0 or when all improvements are None | Return 0.0 for avg_delta when rounds list is empty or all deltas are None. Guard every division with a length check. |
 | 2 | Gate priority inversion | Evaluating Gate 5 (exhausted) before Gate 3 (near target) | A near-target kernel is forced into EXPLORE and regresses instead of fine-tuning to completion | Gates are evaluated in strict priority order via an ordered sequence with early return. The order is tested explicitly in unit tests. |
 | 3 | LLM exception propagation | Not wrapping LLM call in try/except | An LLM timeout or network error crashes the Navigator and the entire optimization loop | All LLM calls are wrapped in exception handling. Any exception increments the failure counter and triggers retry or UCB1 fallback (INV-NAV-003). |
-| 4 | Tabu filter too strict | Checking only the direction tag without the base kernel hash | A direction that was tabu on one kernel is blocked even when applied to a different, potentially better base kernel | Tabu matches on (base_kernel_hash, intent_tag) pairs, not on the tag alone (INV-NAV-005). |
+| 4 | Tabu filter too strict | Checking only the direction tag without the base kernel hash | A direction that was tabu on one kernel is blocked even when applied to a different, potentially better base kernel | Tabu matches on typed `TabuEntry(base_kernel_hash, direction)` with expiry check, not on the direction tag alone (INV-NAV-005). |
 | 5 | UCB1 starvation of known-good directions | Setting UCB1 C coefficient too high | The exploration bonus overwhelms exploitation, causing the system to keep trying bad directions instead of refining good ones | C defaults to sqrt(2) per standard UCB1 theory. The value is configurable for tuning. Direction stats include avg_perf_gain to maintain exploitation pressure. |
 | 6 | Exhausted direction silently re-selected by LLM | Not validating the LLM's chosen direction against the exhausted set | The system wastes rounds re-trying a direction that has already proven ineffective | LLM validation checks direction against the exhausted set (validation rule 5 in §6.3). Exhausted directions are also excluded from UCB1 candidates. |
 | 7 | StrategyDirective extension breaks Orchestrator | Adding required (non-Optional) fields to StrategyDirective | Existing Orchestrator code and stubs that construct StrategyDirective without the new fields fail at runtime | All new fields are Optional with None defaults (REQ-NAV-009). Existing code continues to work unchanged. |
@@ -702,6 +700,6 @@ Trigger: Global best latency has reached within 95% of target.
 | SC-5: Exhausted direction forces EXPLORE | REQ-NAV-005 | SCN-NAV-005-01, SCN-NAV-005-02 |
 | SC-6: LLM failure degrades to retry then UCB1 | REQ-NAV-006 | SCN-NAV-006-01, SCN-NAV-006-02, SCN-NAV-006-03, SCN-NAV-006-04, SCN-NAV-006-05 |
 | SC-7: UCB1 selects least-explored direction | REQ-NAV-007 | SCN-NAV-007-01, SCN-NAV-007-02, SCN-NAV-007-03 |
-| SC-8: StrategyDirective has complete fields | REQ-NAV-008 | SCN-NAV-008-03, SCN-NAV-008-04, SCN-NAV-008-05, SCN-NAV-008-06, SCN-NAV-008-07 |
+| SC-8: StrategyDirective has complete fields | REQ-NAV-008 | SCN-NAV-008-01, SCN-NAV-008-02, SCN-NAV-008-03, SCN-NAV-008-04, SCN-NAV-008-05, SCN-NAV-008-06, SCN-NAV-008-07 |
 | SC-9: Orchestrator tests pass after extension | REQ-NAV-009 | (verified by running existing test suite after StrategyDirective extension) |
 | SC-10: mypy --strict and ruff check pass | QG-NAV-001, QG-NAV-002 | (verified by CI tooling) |
