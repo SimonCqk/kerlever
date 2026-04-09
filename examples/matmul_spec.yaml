@@ -1,12 +1,17 @@
 op_name: matmul
 op_semantics: "C[M,N] = A[M,K] @ B[K,N]"
-shapes:
-  - [4096, 4096, 4096]
 dtype: float16
 target_gpu: A100
-baseline_perf_us: 5.0
-target_perf_us: 1.0
-tolerance: 0.05
+shape_cases:
+  - shape_id: "4k_square"
+    dims: [4096, 4096, 4096]
+    weight: 1.0
+    profile: true
+objective:
+  primary_metric: weighted_p50_us
+  aggregation: weighted_mean
+  regression_guard_pct: 0.0
+target_metric_value: 1.0
 max_rounds: 20
 reference_kernel: |
   __global__ void matmul(const half* A, const half* B, half* C, int M, int N, int K) {

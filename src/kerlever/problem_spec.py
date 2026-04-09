@@ -16,7 +16,8 @@ def load_problem_spec(path: Path) -> ProblemSpec:
     """Load a ProblemSpec from a YAML file.
 
     Reads the YAML file at the given path and validates it against
-    the ProblemSpec Pydantic model.
+    the ProblemSpec Pydantic model. The YAML must contain shape_cases
+    (list of ShapeCase objects) and an objective (PerformanceObjective).
 
     Args:
         path: Path to the YAML specification file.

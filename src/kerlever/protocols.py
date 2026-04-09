@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from kerlever.types import (
+    BaselineArtifact,
     CrossCandidateAnalysis,
     EvaluationResult,
     KernelCandidate,
@@ -39,9 +40,17 @@ class CodingAgentProtocol(Protocol):
         self,
         problem_spec: ProblemSpec,
         directive: StrategyDirective,
-        current_best_source: str | None,
+        incumbent: BaselineArtifact,
     ) -> list[KernelCandidate]:
-        """Generate kernel candidates based on the directive."""
+        """Generate kernel candidates based on the directive.
+
+        Args:
+            problem_spec: The optimization target specification.
+            directive: The strategy directive for this round.
+            incumbent: The current incumbent BaselineArtifact. The Coding
+                Agent uses incumbent.source_code as the base for
+                exploit-mode mutations.
+        """
         ...
 
 
@@ -52,9 +61,19 @@ class GPUPipelineProtocol(Protocol):
         self,
         candidate: KernelCandidate,
         problem_spec: ProblemSpec,
-        current_best_latency_us: float | None,
+        baseline: BaselineArtifact,
+        incumbent: BaselineArtifact,
     ) -> EvaluationResult:
-        """Evaluate a kernel candidate on GPU hardware."""
+        """Evaluate a kernel candidate on GPU hardware.
+
+        Args:
+            candidate: The kernel candidate to evaluate.
+            problem_spec: The optimization target specification.
+            baseline: The original measured (or V1 synthetic) baseline
+                artifact. Used to compute ObjectiveScore.relative_to_baseline.
+            incumbent: The current best kernel artifact. Used for
+                regression detection and ObjectiveScore.relative_to_incumbent.
+        """
         ...
 
 
