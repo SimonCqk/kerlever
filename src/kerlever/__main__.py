@@ -52,10 +52,10 @@ def main() -> None:
 
     print(f"Status: {result.status}")
     print(f"Best kernel hash: {result.best_kernel_hash}")
-    if result.best_latency_us is not None:
-        print(f"Best latency: {result.best_latency_us:.3f} us")
+    if result.best_objective_score is not None:
+        print(f"Best objective score: {result.best_objective_score:.3f}")
     else:
-        print("Best latency: N/A")
+        print("Best objective score: N/A")
     print(f"Total rounds: {result.total_rounds}")
     print(f"Total candidates evaluated: {result.total_candidates_evaluated}")
 

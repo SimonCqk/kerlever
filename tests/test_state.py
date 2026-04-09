@@ -7,17 +7,24 @@ from pathlib import Path
 
 from kerlever.state import StateManager
 from kerlever.types import (
+    BaselineArtifact,
+    BenchmarkBundle,
+    CandidateIntent,
     CandidateOutcome,
-    CompileResult,
     CompileStatus,
     EvaluationResult,
     KernelCandidate,
     Mode,
+    ObjectiveScore,
     OptimizationResult,
     OptimizationState,
+    PerformanceObjective,
     Phase,
     ProblemSpec,
     RoundState,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
     StrategyDirective,
     SubMode,
 )
@@ -27,14 +34,44 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C = A @ B",
-        shapes=[[1024, 1024, 1024]],
         dtype="float16",
         target_gpu="A100",
-        baseline_perf_us=5.0,
-        target_perf_us=1.0,
-        tolerance=0.05,
+        shape_cases=[
+            ShapeCase(
+                shape_id="default",
+                dims=[1024, 1024, 1024],
+                weight=1.0,
+            ),
+        ],
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=1.0,
         max_rounds=10,
         reference_kernel="__global__ void matmul() {}",
+    )
+
+
+def _make_baseline() -> BaselineArtifact:
+    return BaselineArtifact(
+        kernel_hash="baseline_hash",
+        source_code="__global__ void matmul() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="default",
+                latency_p50_us=5.0,
+                latency_p95_us=6.0,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=5.0,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
     )
 
 
@@ -62,14 +99,31 @@ def test_save_and_load_state(tmp_path: Path) -> None:
     """State round-trip: save then load produces identical data."""
     mgr = StateManager(tmp_path)
     spec = _make_problem_spec()
+    baseline = _make_baseline()
+    incumbent = BaselineArtifact(
+        kernel_hash="better_hash",
+        source_code="__global__ void better() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="default",
+                latency_p50_us=2.5,
+                latency_p95_us=3.0,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=2.5,
+            relative_to_baseline=0.5,
+            relative_to_incumbent=1.0,
+        ),
+    )
     state = OptimizationState(
         problem_spec=spec,
+        baseline=baseline,
+        incumbent=incumbent,
         current_round=3,
-        global_best_hash="abc123",
-        global_best_latency_us=2.5,
-        global_best_source="__global__ void best() {}",
-        tabu_list=["tag1", "tag2"],
-        bottleneck_history=[["memory_bandwidth"]],
     )
 
     mgr.save_state(state)
@@ -77,10 +131,9 @@ def test_save_and_load_state(tmp_path: Path) -> None:
 
     assert loaded is not None
     assert loaded.current_round == 3
-    assert loaded.global_best_hash == "abc123"
-    assert loaded.global_best_latency_us == 2.5
-    assert loaded.tabu_list == ["tag1", "tag2"]
-    assert loaded.bottleneck_history == [["memory_bandwidth"]]
+    assert loaded.incumbent.kernel_hash == "better_hash"
+    assert loaded.incumbent.objective_score.value == 2.5
+    assert loaded.baseline.kernel_hash == "baseline_hash"
     assert loaded.problem_spec.op_name == "matmul"
 
 
@@ -97,13 +150,34 @@ def test_save_and_load_round(tmp_path: Path) -> None:
     candidate = KernelCandidate(
         code_hash="hash1",
         source_code="__global__ void k() {}",
-        intent_tag="opt_mem_0",
-        mode=Mode.EXPLOIT,
-        sub_mode=SubMode.LOCAL_REWRITE,
+        parent_hashes=["parent_hash"],
+        intent=CandidateIntent(
+            direction="optimize_memory",
+            mode=Mode.EXPLOIT,
+            sub_mode=SubMode.LOCAL_REWRITE,
+        ),
     )
     eval_result = EvaluationResult(
         candidate_hash="hash1",
-        compile_result=CompileResult(status=CompileStatus.SUCCESS),
+        compile_status=CompileStatus.SUCCESS,
+        static_analysis=StaticAnalysis(),
+        benchmark=BenchmarkBundle(
+            shape_results=[
+                ShapeBenchResult(
+                    shape_id="default",
+                    latency_p50_us=2.0,
+                    latency_p95_us=2.1,
+                    run_count=10,
+                ),
+            ],
+            objective_score=ObjectiveScore(
+                metric_name="weighted_p50_us",
+                value=2.0,
+                relative_to_baseline=0.4,
+                relative_to_incumbent=0.8,
+            ),
+            regressed_vs_incumbent=False,
+        ),
         outcome=CandidateOutcome.IMPROVED,
     )
     round_state = RoundState(
@@ -113,7 +187,7 @@ def test_save_and_load_round(tmp_path: Path) -> None:
         candidates=[candidate],
         evaluation_results=[eval_result],
         best_candidate_hash="hash1",
-        best_latency_us=2.0,
+        best_objective_score=2.0,
     )
 
     mgr.save_round(round_state)
@@ -124,7 +198,7 @@ def test_save_and_load_round(tmp_path: Path) -> None:
     assert loaded.phase == Phase.ROUND_COMPLETE
     assert len(loaded.candidates) == 1
     assert loaded.candidates[0].code_hash == "hash1"
-    assert loaded.best_latency_us == 2.0
+    assert loaded.best_objective_score == 2.0
 
 
 def test_load_round_returns_none_when_missing(tmp_path: Path) -> None:
@@ -146,8 +220,8 @@ def test_save_kernel(tmp_path: Path) -> None:
 def test_append_decision(tmp_path: Path) -> None:
     """Decision log entries are appended as JSONL."""
     mgr = StateManager(tmp_path)
-    entry1 = {"round_number": 0, "status": "ok"}
-    entry2 = {"round_number": 1, "status": "improved"}
+    entry1: dict[str, object] = {"round_number": 0, "status": "ok"}
+    entry2: dict[str, object] = {"round_number": 1, "status": "improved"}
 
     mgr.append_decision(entry1)
     mgr.append_decision(entry2)
@@ -165,7 +239,7 @@ def test_save_result(tmp_path: Path) -> None:
     result = OptimizationResult(
         status="TARGET_MET",
         best_kernel_hash="best_hash",
-        best_latency_us=0.9,
+        best_objective_score=0.9,
         total_rounds=5,
         total_candidates_evaluated=15,
     )
@@ -177,14 +251,19 @@ def test_save_result(tmp_path: Path) -> None:
     data = json.loads(result_path.read_text())
     assert data["status"] == "TARGET_MET"
     assert data["best_kernel_hash"] == "best_hash"
-    assert data["best_latency_us"] == 0.9
+    assert data["best_objective_score"] == 0.9
 
 
 def test_atomic_write_no_tmp_left(tmp_path: Path) -> None:
     """After atomic write, no .tmp files remain."""
     mgr = StateManager(tmp_path)
     spec = _make_problem_spec()
-    state = OptimizationState(problem_spec=spec)
+    baseline = _make_baseline()
+    state = OptimizationState(
+        problem_spec=spec,
+        baseline=baseline,
+        incumbent=baseline,
+    )
 
     mgr.save_state(state)
 

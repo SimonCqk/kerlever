@@ -15,13 +15,18 @@ def test_load_valid_yaml(tmp_path: Path) -> None:
     yaml_content = """\
 op_name: matmul
 op_semantics: "C[M,N] = A[M,K] @ B[K,N]"
-shapes:
-  - [4096, 4096, 4096]
 dtype: float16
 target_gpu: A100
-baseline_perf_us: 5.0
-target_perf_us: 1.0
-tolerance: 0.05
+shape_cases:
+  - shape_id: "4k_square"
+    dims: [4096, 4096, 4096]
+    weight: 1.0
+    profile: true
+objective:
+  primary_metric: weighted_p50_us
+  aggregation: weighted_mean
+  regression_guard_pct: 0.02
+target_metric_value: 1.0
 max_rounds: 20
 reference_kernel: |
   __global__ void matmul() {}
@@ -34,12 +39,17 @@ reference_kernel: |
     assert isinstance(spec, ProblemSpec)
     assert spec.op_name == "matmul"
     assert spec.op_semantics == "C[M,N] = A[M,K] @ B[K,N]"
-    assert spec.shapes == [[4096, 4096, 4096]]
+    assert len(spec.shape_cases) == 1
+    assert spec.shape_cases[0].shape_id == "4k_square"
+    assert spec.shape_cases[0].dims == [4096, 4096, 4096]
+    assert spec.shape_cases[0].weight == 1.0
+    assert spec.shape_cases[0].profile is True
     assert spec.dtype == "float16"
     assert spec.target_gpu == "A100"
-    assert spec.baseline_perf_us == 5.0
-    assert spec.target_perf_us == 1.0
-    assert spec.tolerance == 0.05
+    assert spec.objective.primary_metric == "weighted_p50_us"
+    assert spec.objective.aggregation == "weighted_mean"
+    assert spec.objective.regression_guard_pct == 0.02
+    assert spec.target_metric_value == 1.0
     assert spec.max_rounds == 20
     assert "matmul" in spec.reference_kernel
 
@@ -72,4 +82,49 @@ def test_load_example_spec() -> None:
     spec = load_problem_spec(spec_file)
     assert spec.op_name == "matmul"
     assert spec.max_rounds == 20
-    assert spec.target_perf_us == 1.0
+    assert spec.target_metric_value == 1.0
+    assert len(spec.shape_cases) > 0
+    assert spec.objective.primary_metric == "weighted_p50_us"
+
+
+def test_load_multiple_shape_cases(tmp_path: Path) -> None:
+    """Load YAML with multiple shape cases and verify all are parsed."""
+    yaml_content = """\
+op_name: matmul
+op_semantics: "C = A @ B"
+dtype: float16
+target_gpu: A100
+shape_cases:
+  - shape_id: "small"
+    dims: [1024, 1024, 1024]
+    weight: 0.3
+    profile: false
+  - shape_id: "medium"
+    dims: [4096, 4096, 4096]
+    weight: 1.0
+    profile: true
+  - shape_id: "large"
+    dims: [8192, 8192, 8192]
+    weight: 0.5
+    correctness_tolerance: 0.01
+    profile: true
+objective:
+  primary_metric: weighted_p50_us
+  aggregation: weighted_mean
+  regression_guard_pct: 0.02
+target_metric_value: 1.0
+max_rounds: 10
+reference_kernel: |
+  __global__ void matmul() {}
+"""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text(yaml_content)
+
+    spec = load_problem_spec(spec_file)
+
+    assert len(spec.shape_cases) == 3
+    assert spec.shape_cases[0].shape_id == "small"
+    assert spec.shape_cases[0].weight == 0.3
+    assert spec.shape_cases[1].shape_id == "medium"
+    assert spec.shape_cases[1].profile is True
+    assert spec.shape_cases[2].correctness_tolerance == 0.01

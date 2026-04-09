@@ -18,32 +18,45 @@ from kerlever.stubs import (
     StubStrategyNavigator,
 )
 from kerlever.types import (
-    BenchResult,
+    BaselineArtifact,
+    BenchmarkBundle,
     CandidateOutcome,
-    CompileResult,
     CompileStatus,
     EvaluationResult,
     KernelCandidate,
+    ObjectiveScore,
     OptimizationState,
+    PerformanceObjective,
     ProblemSpec,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
 )
 
 
 def _make_spec(
-    target_perf_us: float = 1.0,
+    target_metric_value: float = 1.0,
     max_rounds: int = 10,
-    tolerance: float = 0.05,
-    baseline_perf_us: float = 5.0,
 ) -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C = A @ B",
-        shapes=[[1024, 1024, 1024]],
         dtype="float16",
         target_gpu="A100",
-        baseline_perf_us=baseline_perf_us,
-        target_perf_us=target_perf_us,
-        tolerance=tolerance,
+        shape_cases=[
+            ShapeCase(
+                shape_id="default",
+                dims=[1024, 1024, 1024],
+                weight=1.0,
+                profile=True,
+            ),
+        ],
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+            regression_guard_pct=0.0,
+        ),
+        target_metric_value=target_metric_value,
         max_rounds=max_rounds,
         reference_kernel="__global__ void matmul() {}",
     )
@@ -73,14 +86,16 @@ async def test_loop_terminates_target_met(tmp_path: Path) -> None:
     Implements: SCN-ORCH-001-01
     """
     # Use a generous target that the stub's progressive improvement will reach
-    spec = _make_spec(target_perf_us=2.0, max_rounds=20, baseline_perf_us=5.0)
+    # Baseline synthetic score is target_metric_value * 5.0 = 10.0
+    # With progressive improvement, stubs should reach 2.0 within 20 rounds
+    spec = _make_spec(target_metric_value=2.0, max_rounds=20)
     orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
 
     result = await orch.run()
 
     assert result.status == "TARGET_MET"
-    assert result.best_latency_us is not None
-    assert result.best_latency_us <= spec.target_perf_us * (1 + spec.tolerance)
+    assert result.best_objective_score is not None
+    assert result.best_objective_score <= spec.target_metric_value
     assert result.total_rounds <= spec.max_rounds
     assert result.total_rounds > 0
 
@@ -92,7 +107,7 @@ async def test_loop_terminates_max_rounds(tmp_path: Path) -> None:
     Implements: SCN-ORCH-001-02
     """
     # Set an impossibly low target
-    spec = _make_spec(target_perf_us=0.001, max_rounds=3, baseline_perf_us=5.0)
+    spec = _make_spec(target_metric_value=0.001, max_rounds=3)
     orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
 
     result = await orch.run()
@@ -103,7 +118,7 @@ async def test_loop_terminates_max_rounds(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_compile_fail_discarded(tmp_path: Path) -> None:
-    """Compile-failed candidates do not enter global best or analysis.
+    """Compile-failed candidates do not enter incumbent or analysis.
 
     Implements: SCN-ORCH-004-01, REQ-ORCH-004
     """
@@ -115,14 +130,12 @@ async def test_compile_fail_discarded(tmp_path: Path) -> None:
             self,
             candidate: KernelCandidate,
             problem_spec: ProblemSpec,
-            current_best_latency_us: float | None,
+            baseline: BaselineArtifact,
+            incumbent: BaselineArtifact,
         ) -> EvaluationResult:
             return EvaluationResult(
                 candidate_hash=candidate.code_hash,
-                compile_result=CompileResult(
-                    status=CompileStatus.COMPILE_ERROR,
-                    error_message="always fail",
-                ),
+                compile_status=CompileStatus.COMPILE_ERROR,
                 outcome=CandidateOutcome.COMPILE_FAIL,
             )
 
@@ -138,10 +151,14 @@ async def test_compile_fail_discarded(tmp_path: Path) -> None:
 
     result = await orch.run()
 
-    # Global best should never be set since all candidates fail compile
-    assert result.best_kernel_hash is None
-    assert result.best_latency_us is None
+    # Incumbent should still be the baseline (never updated)
+    assert result.best_kernel_hash is not None  # baseline hash
     assert result.status == "MAX_ROUNDS_REACHED"
+
+    # Verify incumbent was never updated beyond baseline
+    state_path = tmp_path / "state.json"
+    state = OptimizationState.model_validate_json(state_path.read_text())
+    assert state.incumbent.kernel_hash == state.baseline.kernel_hash
 
 
 @pytest.mark.asyncio
@@ -158,12 +175,30 @@ async def test_regression_not_in_analysis(tmp_path: Path) -> None:
             self,
             candidate: KernelCandidate,
             problem_spec: ProblemSpec,
-            current_best_latency_us: float | None,
+            baseline: BaselineArtifact,
+            incumbent: BaselineArtifact,
         ) -> EvaluationResult:
             return EvaluationResult(
                 candidate_hash=candidate.code_hash,
-                compile_result=CompileResult(status=CompileStatus.SUCCESS),
-                bench_result=BenchResult(latency_us=99.0, p50_us=98.0, p95_us=100.0),
+                compile_status=CompileStatus.SUCCESS,
+                static_analysis=StaticAnalysis(),
+                benchmark=BenchmarkBundle(
+                    shape_results=[
+                        ShapeBenchResult(
+                            shape_id="default",
+                            latency_p50_us=99.0,
+                            latency_p95_us=100.0,
+                            run_count=10,
+                        ),
+                    ],
+                    objective_score=ObjectiveScore(
+                        metric_name="weighted_p50_us",
+                        value=99.0,
+                        relative_to_baseline=2.0,
+                        relative_to_incumbent=2.0,
+                    ),
+                    regressed_vs_incumbent=True,
+                ),
                 outcome=CandidateOutcome.REGRESSION,
             )
 
@@ -203,35 +238,31 @@ async def test_regression_not_in_analysis(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_global_best_monotonically_non_increasing(
+async def test_incumbent_monotonically_non_increasing(
     tmp_path: Path,
 ) -> None:
-    """Global best latency only decreases across rounds.
+    """Incumbent objective score only decreases across rounds.
 
     Implements: INV-ORCH-001, REQ-ORCH-003
     """
-    spec = _make_spec(target_perf_us=0.001, max_rounds=5, baseline_perf_us=5.0)
+    spec = _make_spec(target_metric_value=0.001, max_rounds=5)
     orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
 
-    result = await orch.run()
+    await orch.run()
 
-    # Load state and verify monotonicity across rounds
+    # Load state and verify incumbent score decreased or stayed same
     state_path = tmp_path / "state.json"
     state = OptimizationState.model_validate_json(state_path.read_text())
 
-    # Track global best through rounds
-    best_so_far: float | None = None
-    for round_summary in state.rounds:
-        if round_summary.best_latency_us is not None:
-            if best_so_far is None:
-                best_so_far = round_summary.best_latency_us
-            else:
-                # Round best can be anything, but global best only improves
-                pass
+    # The incumbent should have a valid objective score
+    assert state.incumbent.objective_score.value is not None
 
-    # The final global best should be set
-    assert state.global_best_latency_us is not None
-    assert result.best_latency_us == state.global_best_latency_us
+    # Verify that round summaries show non-negative gains (or None)
+    for rs in state.rounds:
+        if rs.abs_gain_vs_prev_best_us is not None:
+            assert rs.abs_gain_vs_prev_best_us >= 0.0
+        if rs.rel_gain_vs_prev_best is not None:
+            assert rs.rel_gain_vs_prev_best >= 0.0
 
 
 @pytest.mark.asyncio
@@ -240,7 +271,7 @@ async def test_workdir_files_created(tmp_path: Path) -> None:
 
     Implements: SCN-ORCH-002-01, REQ-ORCH-002
     """
-    spec = _make_spec(max_rounds=3, target_perf_us=0.001)
+    spec = _make_spec(max_rounds=3, target_metric_value=0.001)
     orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
 
     result = await orch.run()
@@ -286,15 +317,33 @@ async def test_concurrent_eval_isolates_failures(tmp_path: Path) -> None:
             self,
             candidate: KernelCandidate,
             problem_spec: ProblemSpec,
-            current_best_latency_us: float | None,
+            baseline: BaselineArtifact,
+            incumbent: BaselineArtifact,
         ) -> EvaluationResult:
             self._call_count += 1
             if self._call_count % 3 == 2:
                 raise RuntimeError("Simulated infrastructure failure")
             return EvaluationResult(
                 candidate_hash=candidate.code_hash,
-                compile_result=CompileResult(status=CompileStatus.SUCCESS),
-                bench_result=BenchResult(latency_us=2.0, p50_us=1.9, p95_us=2.1),
+                compile_status=CompileStatus.SUCCESS,
+                static_analysis=StaticAnalysis(),
+                benchmark=BenchmarkBundle(
+                    shape_results=[
+                        ShapeBenchResult(
+                            shape_id="default",
+                            latency_p50_us=2.0,
+                            latency_p95_us=2.1,
+                            run_count=10,
+                        ),
+                    ],
+                    objective_score=ObjectiveScore(
+                        metric_name="weighted_p50_us",
+                        value=2.0,
+                        relative_to_baseline=0.4,
+                        relative_to_incumbent=0.4,
+                    ),
+                    regressed_vs_incumbent=False,
+                ),
                 outcome=CandidateOutcome.IMPROVED,
             )
 
@@ -343,22 +392,37 @@ async def test_cross_analysis_skipped_with_fewer_than_2(
             self,
             candidate: KernelCandidate,
             problem_spec: ProblemSpec,
-            current_best_latency_us: float | None,
+            baseline: BaselineArtifact,
+            incumbent: BaselineArtifact,
         ) -> EvaluationResult:
             self._call_count += 1
             if self._call_count % 3 == 1:
                 return EvaluationResult(
                     candidate_hash=candidate.code_hash,
-                    compile_result=CompileResult(status=CompileStatus.SUCCESS),
-                    bench_result=BenchResult(latency_us=2.0, p50_us=1.9, p95_us=2.1),
+                    compile_status=CompileStatus.SUCCESS,
+                    static_analysis=StaticAnalysis(),
+                    benchmark=BenchmarkBundle(
+                        shape_results=[
+                            ShapeBenchResult(
+                                shape_id="default",
+                                latency_p50_us=2.0,
+                                latency_p95_us=2.1,
+                                run_count=10,
+                            ),
+                        ],
+                        objective_score=ObjectiveScore(
+                            metric_name="weighted_p50_us",
+                            value=2.0,
+                            relative_to_baseline=0.4,
+                            relative_to_incumbent=0.4,
+                        ),
+                        regressed_vs_incumbent=False,
+                    ),
                     outcome=CandidateOutcome.IMPROVED,
                 )
             return EvaluationResult(
                 candidate_hash=candidate.code_hash,
-                compile_result=CompileResult(
-                    status=CompileStatus.COMPILE_ERROR,
-                    error_message="fail",
-                ),
+                compile_status=CompileStatus.COMPILE_ERROR,
                 outcome=CandidateOutcome.COMPILE_FAIL,
             )
 
@@ -398,12 +462,12 @@ async def test_cross_analysis_skipped_with_fewer_than_2(
 
 
 @pytest.mark.asyncio
-async def test_tabu_list_updated_every_round(tmp_path: Path) -> None:
-    """Tabu list is extended with all intent_tags each round.
+async def test_attempt_records_created(tmp_path: Path) -> None:
+    """AttemptRecords are created for every candidate in every round.
 
-    Addresses Shortcut Risk #5 from spec.md.
+    Implements: SCN-ORCH-010-01, INV-ORCH-007
     """
-    spec = _make_spec(max_rounds=2, target_perf_us=0.001)
+    spec = _make_spec(max_rounds=2, target_metric_value=0.001)
     orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
 
     await orch.run()
@@ -411,8 +475,65 @@ async def test_tabu_list_updated_every_round(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     state = OptimizationState.model_validate_json(state_path.read_text())
 
-    # With 3 candidates per round and 2 rounds, tabu should have 6 entries
-    assert len(state.tabu_list) == 6
+    # With 3 candidates per round and 2 rounds, should have 6 attempt records
+    assert len(state.attempts) == 6
+
+    # Each attempt record should have required fields
+    for attempt in state.attempts:
+        assert attempt.round_number >= 0
+        assert attempt.candidate_hash != ""
+        assert attempt.direction != ""
+        assert attempt.outcome in CandidateOutcome
+
+
+@pytest.mark.asyncio
+async def test_tabu_entries_created(tmp_path: Path) -> None:
+    """TabuEntry entries are created for non-improving directions.
+
+    Implements: SCN-ORCH-010-01, SCN-ORCH-010-02
+    """
+    spec = _make_spec(max_rounds=2, target_metric_value=0.001)
+    orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
+
+    await orch.run()
+
+    state_path = tmp_path / "state.json"
+    state = OptimizationState.model_validate_json(state_path.read_text())
+
+    # Tabu entries should be created for non-IMPROVED candidates
+    assert len(state.tabu_entries) > 0
+
+    # Each tabu entry should have an expiry round
+    for entry in state.tabu_entries:
+        assert entry.expires_after_round > entry.round_number
+        assert entry.direction != ""
+
+
+@pytest.mark.asyncio
+async def test_round_summary_has_gain_fields(tmp_path: Path) -> None:
+    """RoundSummary contains both absolute and relative gains.
+
+    Implements: SCN-ORCH-012-01
+    """
+    spec = _make_spec(target_metric_value=0.001, max_rounds=5)
+    orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
+
+    await orch.run()
+
+    state_path = tmp_path / "state.json"
+    state = OptimizationState.model_validate_json(state_path.read_text())
+
+    # At least one round should show improvement
+    any_improvement = False
+    for rs in state.rounds:
+        if rs.abs_gain_vs_prev_best_us is not None:
+            any_improvement = True
+            assert rs.abs_gain_vs_prev_best_us > 0.0
+            assert rs.rel_gain_vs_prev_best is not None
+            assert rs.rel_gain_vs_prev_best > 0.0
+            assert rs.rel_gain_vs_prev_best < 1.0  # relative gain < 100%
+
+    assert any_improvement, "Expected at least one improving round"
 
 
 @pytest.mark.asyncio
@@ -433,3 +554,44 @@ async def test_kernels_persisted_before_evaluation(tmp_path: Path) -> None:
     # All kernel files should have non-empty content
     for kf in kernel_files:
         assert kf.stat().st_size > 0
+
+
+@pytest.mark.asyncio
+async def test_bottleneck_history_populated(tmp_path: Path) -> None:
+    """Bottleneck history is populated from profiled candidates.
+
+    Addresses spec 6.6: BottleneckAssessment from ProfileBundle of best
+    profiled candidate is appended to bottleneck_history.
+    """
+    spec = _make_spec(max_rounds=3, target_metric_value=0.001)
+    orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
+
+    await orch.run()
+
+    state_path = tmp_path / "state.json"
+    state = OptimizationState.model_validate_json(state_path.read_text())
+
+    # Bottleneck history should have entries (stubs produce profile data)
+    assert len(state.bottleneck_history) > 0
+    for assessment in state.bottleneck_history:
+        assert len(assessment.tags) > 0
+        assert len(assessment.evidence) > 0
+
+
+@pytest.mark.asyncio
+async def test_baseline_never_changes(tmp_path: Path) -> None:
+    """Baseline artifact is never modified during the optimization loop.
+
+    Implements: INV-ORCH-006
+    """
+    spec = _make_spec(max_rounds=3, target_metric_value=0.001)
+    orch = _make_orchestrator(tmp_path, spec=spec, seed=42)
+
+    await orch.run()
+
+    state_path = tmp_path / "state.json"
+    state = OptimizationState.model_validate_json(state_path.read_text())
+
+    # Baseline should still match the reference kernel
+    assert state.baseline.source_code == spec.reference_kernel
+    assert state.baseline.kernel_hash is not None
