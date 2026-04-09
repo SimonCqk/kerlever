@@ -12,14 +12,20 @@ import pytest
 
 from kerlever.coding_agent.config import CodingAgentConfig
 from kerlever.coding_agent.generator import (
-    build_intent_tag,
     compute_code_hash,
     generate_one_candidate,
     parse_cuda_from_response,
 )
 from kerlever.coding_agent.hardware import get_gpu_spec
 from kerlever.coding_agent.playbook import get_relevant_playbook
-from kerlever.types import Mode, ProblemSpec, StrategyDirective, SubMode
+from kerlever.types import (
+    Mode,
+    PerformanceObjective,
+    ProblemSpec,
+    ShapeCase,
+    StrategyDirective,
+    SubMode,
+)
 
 # Valid CUDA kernel that passes all validation checks
 VALID_CUDA = """\
@@ -47,12 +53,17 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="Matrix multiplication C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
+        shape_cases=[
+            ShapeCase(shape_id="s0", dims=[1024, 1024]),
+            ShapeCase(shape_id="s1", dims=[1024, 1024]),
+        ],
         dtype="float16",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=50.0,
-        tolerance=0.05,
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=50.0,
         max_rounds=10,
         reference_kernel="// ref",
     )
@@ -163,29 +174,6 @@ class TestComputeCodeHash:
         assert h1 != h2
 
 
-class TestBuildIntentTag:
-    """Tests for intent tag construction."""
-
-    def test_format(self) -> None:
-        """SCN-CA-007-02: Intent tag has expected format."""
-        directive = _make_directive(
-            sub_mode=SubMode.LOCAL_REWRITE,
-            direction="reduce_register_pressure",
-        )
-        tag = build_intent_tag(directive, 0, SubMode.LOCAL_REWRITE)
-        assert tag == "local_rewrite_reduce_register_pressure_0"
-
-    def test_de_novo_format(self) -> None:
-        """DE_NOVO intent tag format."""
-        directive = _make_directive(
-            mode=Mode.EXPLORE,
-            sub_mode=SubMode.DE_NOVO,
-            direction="initial_exploration",
-        )
-        tag = build_intent_tag(directive, 2, SubMode.DE_NOVO)
-        assert tag == "de_novo_initial_exploration_2"
-
-
 class TestGenerateOneCandidate:
     """Tests for per-candidate generation flow."""
 
@@ -227,9 +215,9 @@ class TestGenerateOneCandidate:
 
         assert result is not None
         assert "__global__" in result.source_code
-        assert result.mode == Mode.EXPLOIT
-        assert result.sub_mode == SubMode.LOCAL_REWRITE
-        assert result.parent_hash == "parent123"
+        assert result.intent.mode == Mode.EXPLOIT
+        assert result.intent.sub_mode == SubMode.LOCAL_REWRITE
+        assert result.parent_hashes == ["parent123"]
         assert len(result.code_hash) == 16
 
     async def test_retry_on_invalid_code(
@@ -356,12 +344,12 @@ class TestGenerateOneCandidate:
         assert result is not None
         assert llm.call_count == 2
 
-    async def test_de_novo_parent_hash_is_none(
+    async def test_de_novo_parent_hashes_is_empty(
         self,
         config: CodingAgentConfig,
         problem_spec: ProblemSpec,
     ) -> None:
-        """DE_NOVO candidates have parent_hash = None."""
+        """DE_NOVO candidates have parent_hashes = []."""
         directive = _make_directive(mode=Mode.EXPLORE, sub_mode=SubMode.DE_NOVO)
         llm = StubLLMClient([f"```cuda\n{VALID_CUDA}\n```"])
         gpu = get_gpu_spec("A100")
@@ -381,4 +369,4 @@ class TestGenerateOneCandidate:
         )
 
         assert result is not None
-        assert result.parent_hash is None
+        assert result.parent_hashes == []

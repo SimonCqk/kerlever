@@ -21,6 +21,7 @@ from kerlever.coding_agent.prompt_builder import (
 from kerlever.coding_agent.types import GPUSpec, PlaybookLayer
 from kerlever.llm_client import LLMClientProtocol
 from kerlever.types import (
+    CandidateIntent,
     KernelCandidate,
     ProblemSpec,
     StrategyDirective,
@@ -97,30 +98,6 @@ def compute_code_hash(source_code: str) -> str:
     Invariant: INV-CA-003 (deterministic and collision-resistant)
     """
     return hashlib.sha256(source_code.encode()).hexdigest()[:16]
-
-
-def build_intent_tag(
-    directive: StrategyDirective,
-    candidate_index: int,
-    effective_sub_mode: SubMode,
-) -> str:
-    """Build the intent tag for a candidate.
-
-    Format: "{sub_mode}_{direction}_{index}"
-
-    Args:
-        directive: The strategy directive.
-        candidate_index: Index of the candidate.
-        effective_sub_mode: The effective sub-mode after fallback.
-
-    Returns:
-        Intent tag string.
-
-    Implements: REQ-CA-007, SCN-CA-007-02
-    """
-    mode_tag = effective_sub_mode.value.lower()
-    direction = directive.direction
-    return f"{mode_tag}_{direction}_{candidate_index}"
 
 
 async def generate_one_candidate(
@@ -246,6 +223,11 @@ def _assemble_candidate(
 ) -> KernelCandidate:
     """Assemble a KernelCandidate from validated source code.
 
+    Builds a CandidateIntent from the directive's fields and determines
+    parent_hashes based on the effective sub-mode: empty for DE_NOVO,
+    directive.parent_candidates for RECOMBINATION, and
+    [directive.base_kernel_hash] for single-parent modes.
+
     Args:
         source_code: Validated CUDA source code.
         directive: Strategy directive.
@@ -258,20 +240,31 @@ def _assemble_candidate(
     Implements: REQ-CA-007, INV-CA-006
     """
     code_hash = compute_code_hash(source_code)
-    intent_tag = build_intent_tag(directive, candidate_index, effective_sub_mode)
 
-    # For DE_NOVO, parent_hash is None per spec
-    parent_hash: str | None
+    intent = CandidateIntent(
+        direction=directive.direction,
+        mode=directive.mode,
+        sub_mode=effective_sub_mode,
+        rationale=None,
+    )
+
+    # Determine parent_hashes based on sub-mode per spec:
+    # - DE_NOVO: [] (no parent)
+    # - RECOMBINATION: directive.parent_candidates (multiple parents)
+    # - Single-parent modes: [directive.base_kernel_hash]
+    parent_hashes: list[str]
     if effective_sub_mode == SubMode.DE_NOVO:
-        parent_hash = None
+        parent_hashes = []
+    elif effective_sub_mode == SubMode.RECOMBINATION:
+        parent_hashes = directive.parent_candidates or []
     else:
-        parent_hash = directive.base_kernel_hash
+        parent_hashes = (
+            [directive.base_kernel_hash] if directive.base_kernel_hash else []
+        )
 
     return KernelCandidate(
         code_hash=code_hash,
         source_code=source_code,
-        intent_tag=intent_tag,
-        parent_hash=parent_hash,
-        mode=directive.mode,
-        sub_mode=directive.sub_mode,
+        intent=intent,
+        parent_hashes=parent_hashes,
     )

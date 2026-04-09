@@ -12,7 +12,15 @@ from kerlever.coding_agent.prompt_builder import (
     build_system_prompt,
     build_user_prompt,
 )
-from kerlever.types import Mode, ProblemSpec, StrategyDirective, SubMode
+from kerlever.types import (
+    Mode,
+    PerformanceObjective,
+    ProblemSpec,
+    ShapeCase,
+    StrategyDirective,
+    SubMode,
+    TabuEntry,
+)
 
 
 def _make_problem_spec() -> ProblemSpec:
@@ -20,12 +28,17 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="Matrix multiplication C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
+        shape_cases=[
+            ShapeCase(shape_id="s0", dims=[1024, 1024]),
+            ShapeCase(shape_id="s1", dims=[1024, 1024]),
+        ],
         dtype="float16",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=50.0,
-        tolerance=0.05,
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=50.0,
         max_rounds=10,
         reference_kernel="__global__ void ref_matmul() { /* ref */ }",
     )
@@ -44,7 +57,15 @@ def _make_directive(
         reason="test",
         base_kernel_hash="abc123",
         num_candidates=num_candidates,
-        tabu=["old_approach_1"],
+        tabu=[
+            TabuEntry(
+                base_kernel_hash=None,
+                direction="old_approach_1",
+                sub_mode=None,
+                round_number=0,
+                expires_after_round=5,
+            ),
+        ],
         sub_mode=sub_mode,
         search_range={"block_size": [128.0, 256.0, 512.0]},
         hard_constraints=["max_smem_48KB"],

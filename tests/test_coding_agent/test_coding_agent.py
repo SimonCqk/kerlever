@@ -8,7 +8,18 @@ Spec: docs/coding-agent/spec.md §6.6
 from __future__ import annotations
 
 from kerlever.coding_agent import CodingAgent
-from kerlever.types import Mode, ProblemSpec, StrategyDirective, SubMode
+from kerlever.types import (
+    BaselineArtifact,
+    Mode,
+    ObjectiveScore,
+    PerformanceObjective,
+    ProblemSpec,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
+    StrategyDirective,
+    SubMode,
+)
 
 # Valid CUDA kernels for test stubs — each is slightly different to avoid dedup
 VALID_KERNELS = [
@@ -75,14 +86,41 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="Matrix multiplication C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
+        shape_cases=[
+            ShapeCase(shape_id="s0", dims=[1024, 1024]),
+            ShapeCase(shape_id="s1", dims=[1024, 1024]),
+        ],
         dtype="float16",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=50.0,
-        tolerance=0.05,
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=50.0,
         max_rounds=10,
         reference_kernel="__global__ void ref() { int x = 1; }",
+    )
+
+
+def _make_incumbent(source_code: str = "// incumbent kernel") -> BaselineArtifact:
+    return BaselineArtifact(
+        kernel_hash="incumbent_hash",
+        source_code=source_code,
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="s0",
+                latency_p50_us=100.0,
+                latency_p95_us=120.0,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=100.0,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
     )
 
 
@@ -148,14 +186,14 @@ class TestCodingAgentDeNovo:
             sub_mode=SubMode.DE_NOVO,
         )
 
-        candidates = await agent.generate(spec, directive, None)
+        candidates = await agent.generate(spec, directive, _make_incumbent())
 
         assert len(candidates) == 3
         for c in candidates:
             assert "__global__" in c.source_code
-            assert c.mode == Mode.EXPLORE
-            assert c.sub_mode == SubMode.DE_NOVO
-            assert c.parent_hash is None
+            assert c.intent.mode == Mode.EXPLORE
+            assert c.intent.sub_mode == SubMode.DE_NOVO
+            assert c.parent_hashes == []
 
     async def test_all_hashes_distinct(self) -> None:
         """All code_hash values are distinct."""
@@ -172,7 +210,7 @@ class TestCodingAgentDeNovo:
             sub_mode=SubMode.DE_NOVO,
         )
 
-        candidates = await agent.generate(spec, directive, None)
+        candidates = await agent.generate(spec, directive, _make_incumbent())
 
         hashes = [c.code_hash for c in candidates]
         assert len(set(hashes)) == len(hashes)
@@ -198,7 +236,7 @@ class TestCodingAgentDeNovo:
             sub_mode=SubMode.DE_NOVO,
         )
 
-        candidates = await agent.generate(spec, directive, None)
+        candidates = await agent.generate(spec, directive, _make_incumbent())
 
         # At least the third candidate should succeed
         assert len(candidates) >= 1
@@ -209,7 +247,7 @@ class TestCodingAgentExploit:
     """SCN-CA-002-01: EXPLOIT/LOCAL_REWRITE generation."""
 
     async def test_local_rewrite_with_parent(self) -> None:
-        """LOCAL_REWRITE sets parent_hash from directive."""
+        """LOCAL_REWRITE sets parent_hashes from directive."""
         llm = IndexedStubLLMClient()
         agent = CodingAgent(llm)
         spec = _make_problem_spec()
@@ -223,13 +261,15 @@ class TestCodingAgentExploit:
             sub_mode=SubMode.LOCAL_REWRITE,
         )
 
-        candidates = await agent.generate(spec, directive, VALID_KERNELS[0])
+        candidates = await agent.generate(
+            spec, directive, _make_incumbent(VALID_KERNELS[0])
+        )
 
         assert len(candidates) > 0
         for c in candidates:
-            assert c.parent_hash == "parent_hash_abc"
-            assert c.mode == Mode.EXPLOIT
-            assert c.sub_mode == SubMode.LOCAL_REWRITE
+            assert c.parent_hashes == ["parent_hash_abc"]
+            assert c.intent.mode == Mode.EXPLOIT
+            assert c.intent.sub_mode == SubMode.LOCAL_REWRITE
 
     async def test_exploit_without_best_source_falls_back(self) -> None:
         """SCN-CA-002-02: EXPLOIT without current_best_source falls back to DE_NOVO."""
@@ -246,13 +286,14 @@ class TestCodingAgentExploit:
             sub_mode=SubMode.LOCAL_REWRITE,
         )
 
-        # current_best_source is None -> falls back to DE_NOVO-style
-        candidates = await agent.generate(spec, directive, None)
+        # incumbent with empty source_code -> falls back to DE_NOVO-style
+        empty_incumbent = _make_incumbent("")
+        candidates = await agent.generate(spec, directive, empty_incumbent)
 
         assert len(candidates) > 0
         # Mode is still EXPLOIT (reflecting original directive per spec)
         for c in candidates:
-            assert c.mode == Mode.EXPLOIT
+            assert c.intent.mode == Mode.EXPLOIT
 
 
 class TestCodingAgentErrorHandling:
@@ -273,7 +314,7 @@ class TestCodingAgentErrorHandling:
             sub_mode=SubMode.DE_NOVO,
         )
 
-        candidates = await agent.generate(spec, directive, None)
+        candidates = await agent.generate(spec, directive, _make_incumbent())
 
         assert candidates == []
 
@@ -294,13 +335,13 @@ class TestCodingAgentErrorHandling:
             sub_mode=SubMode.DE_NOVO,
         )
 
-        candidates = await agent.generate(spec, directive, None)
+        candidates = await agent.generate(spec, directive, _make_incumbent())
 
         # Should be deduplicated to 1
         assert len(candidates) == 1
 
-    async def test_intent_tag_contains_direction(self) -> None:
-        """SCN-CA-007-02: intent_tag references direction."""
+    async def test_intent_contains_direction(self) -> None:
+        """SCN-CA-007-02: intent references direction."""
         llm = IndexedStubLLMClient()
         agent = CodingAgent(llm)
         spec = _make_problem_spec()
@@ -314,10 +355,14 @@ class TestCodingAgentErrorHandling:
             sub_mode=SubMode.LOCAL_REWRITE,
         )
 
-        candidates = await agent.generate(spec, directive, VALID_KERNELS[0])
+        candidates = await agent.generate(
+            spec, directive, _make_incumbent(VALID_KERNELS[0])
+        )
 
         assert len(candidates) == 1
-        assert "reduce_register_pressure" in candidates[0].intent_tag
+        assert candidates[0].intent.direction == "reduce_register_pressure"
+        assert candidates[0].intent.mode == Mode.EXPLOIT
+        assert candidates[0].intent.sub_mode == SubMode.LOCAL_REWRITE
 
     async def test_unknown_gpu_does_not_crash(self) -> None:
         """REQ-CA-011: Unknown GPU returns valid candidates."""
@@ -326,12 +371,14 @@ class TestCodingAgentErrorHandling:
         spec = ProblemSpec(
             op_name="matmul",
             op_semantics="Matrix multiplication",
-            shapes=[[1024, 1024]],
+            shape_cases=[ShapeCase(shape_id="s0", dims=[1024, 1024])],
             dtype="float16",
             target_gpu="IMAGINARY_GPU_9999",
-            baseline_perf_us=100.0,
-            target_perf_us=50.0,
-            tolerance=0.05,
+            objective=PerformanceObjective(
+                primary_metric="weighted_p50_us",
+                aggregation="weighted_mean",
+            ),
+            target_metric_value=50.0,
             max_rounds=10,
             reference_kernel="// ref",
         )
@@ -345,7 +392,7 @@ class TestCodingAgentErrorHandling:
             sub_mode=SubMode.DE_NOVO,
         )
 
-        candidates = await agent.generate(spec, directive, None)
+        candidates = await agent.generate(spec, directive, _make_incumbent())
 
         assert len(candidates) >= 1
 

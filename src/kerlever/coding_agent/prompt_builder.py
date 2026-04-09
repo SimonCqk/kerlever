@@ -147,9 +147,10 @@ def _build_local_rewrite_prompt(
         parts.append(f"Constraints: {', '.join(directive.hard_constraints)}")
 
     if directive.tabu:
+        tabu_directions = [entry.direction for entry in directive.tabu]
         parts.append(
             "Do not replicate these previously attempted approaches: "
-            f"{', '.join(directive.tabu)}"
+            f"{', '.join(tabu_directions)}"
         )
 
     return "\n\n".join(parts)
@@ -212,9 +213,10 @@ def _build_de_novo_prompt(
     directive: StrategyDirective,
 ) -> str:
     """Build user prompt for EXPLORE/DE_NOVO sub-mode."""
+    shape_info = [(sc.shape_id, sc.dims, sc.weight) for sc in problem_spec.shape_cases]
     parts = [
         f"Target operation: {problem_spec.op_semantics}",
-        f"Input shapes: {problem_spec.shapes}, dtype: {problem_spec.dtype}",
+        f"Input shapes: {shape_info}, dtype: {problem_spec.dtype}",
         f"Optimization direction: {directive.direction}",
         (
             f"Task: Implement a high-performance {problem_spec.op_name} "

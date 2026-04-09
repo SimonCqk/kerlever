@@ -18,6 +18,7 @@ from kerlever.coding_agent.prompt_builder import build_system_prompt
 from kerlever.coding_agent.types import GPUSpec, PlaybookLayer
 from kerlever.llm_client import LLMClientProtocol
 from kerlever.types import (
+    BaselineArtifact,
     KernelCandidate,
     Mode,
     ProblemSpec,
@@ -52,7 +53,7 @@ class CodingAgent:
         self,
         problem_spec: ProblemSpec,
         directive: StrategyDirective,
-        current_best_source: str | None,
+        incumbent: BaselineArtifact,
     ) -> list[KernelCandidate]:
         """Generate kernel candidates based on the directive.
 
@@ -65,7 +66,9 @@ class CodingAgent:
         Args:
             problem_spec: Target problem specification.
             directive: Strategy directive from the Navigator.
-            current_best_source: Current best kernel source (None on first round).
+            incumbent: The current incumbent BaselineArtifact. The Coding
+                Agent uses incumbent.source_code as the base for
+                exploit-mode mutations.
 
         Returns:
             List of KernelCandidate objects. May be empty if all
@@ -76,6 +79,9 @@ class CodingAgent:
         Invariant: INV-CA-002 (LLM failures never propagate)
         Invariant: INV-CA-006 (mode/sub_mode match directive)
         """
+        # Extract current best source from incumbent for prompt building
+        current_best_source = incumbent.source_code if incumbent else None
+
         # Step 1: Resolve context
         gpu_spec = get_gpu_spec(problem_spec.target_gpu)
         playbook_layers = get_relevant_playbook(
@@ -162,12 +168,12 @@ def _resolve_effective_sub_mode(
     # Fallback: EXPLOIT without current_best_source -> DE_NOVO-style
     if (
         directive.mode == Mode.EXPLOIT
-        and current_best_source is None
+        and not current_best_source
         and sub_mode
         in (SubMode.LOCAL_REWRITE, SubMode.PARAM_SEARCH, SubMode.PATTERN_APPLY)
     ):
         logger.warning(
-            "EXPLOIT sub_mode %s requested but current_best_source is None; "
+            "EXPLOIT sub_mode %s requested but current_best_source is empty; "
             "falling back to DE_NOVO-style generation",
             sub_mode,
         )
