@@ -8,7 +8,19 @@ from __future__ import annotations
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.navigator.gates import check_gates
 from kerlever.navigator.types import DerivedSignals
-from kerlever.types import Mode, OptimizationState, ProblemSpec, SubMode
+from kerlever.types import (
+    BaselineArtifact,
+    BottleneckAssessment,
+    Mode,
+    ObjectiveScore,
+    OptimizationState,
+    PerformanceObjective,
+    ProblemSpec,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
+    SubMode,
+)
 
 
 def _make_problem_spec(**kwargs: object) -> ProblemSpec:
@@ -16,12 +28,14 @@ def _make_problem_spec(**kwargs: object) -> ProblemSpec:
     defaults: dict[str, object] = {
         "op_name": "matmul",
         "op_semantics": "C = A @ B",
-        "shapes": [[1024, 1024], [1024, 1024]],
         "dtype": "float32",
         "target_gpu": "A100",
-        "baseline_perf_us": 100.0,
-        "target_perf_us": 10.0,
-        "tolerance": 0.05,
+        "shape_cases": [ShapeCase(shape_id="s1", dims=[1024, 1024])],
+        "objective": PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        "target_metric_value": 10.0,
         "max_rounds": 20,
         "reference_kernel": "__global__ void k() {}",
     }
@@ -29,11 +43,45 @@ def _make_problem_spec(**kwargs: object) -> ProblemSpec:
     return ProblemSpec(**defaults)  # type: ignore[arg-type]
 
 
+def _make_baseline(
+    kernel_hash: str = "baseline_hash",
+    score_value: float = 100.0,
+) -> BaselineArtifact:
+    """Create a minimal BaselineArtifact."""
+    return BaselineArtifact(
+        kernel_hash=kernel_hash,
+        source_code="__global__ void k() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="s1",
+                latency_p50_us=score_value,
+                latency_p95_us=score_value * 1.1,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=score_value,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
+    )
+
+
 def _make_state(**kwargs: object) -> OptimizationState:
     """Create an OptimizationState with overrides."""
+    ps = _make_problem_spec()
+    bl = _make_baseline()
     defaults: dict[str, object] = {
-        "problem_spec": _make_problem_spec(),
+        "problem_spec": ps,
+        "baseline": bl,
+        "incumbent": bl,
         "current_round": 0,
+        "rounds": [],
+        "attempts": [],
+        "tabu_entries": [],
+        "bottleneck_history": [],
     }
     defaults.update(kwargs)
     return OptimizationState(**defaults)  # type: ignore[arg-type]
@@ -78,7 +126,14 @@ class TestGate2Plateau:
     def test_plateau_returns_explore(self) -> None:
         state = _make_state(
             current_round=4,
-            bottleneck_history=[["memory_bandwidth"]],
+            bottleneck_history=[
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+            ],
         )
         signals = _make_signals(
             is_plateau=True,
@@ -110,15 +165,23 @@ class TestGate3NearTarget:
     """Gate 3: near target forces EXPLOIT PARAM_SEARCH."""
 
     def test_near_target_returns_exploit(self) -> None:
-        # target = 10.0us, threshold = 0.95
-        # Gate fires when best <= target / 0.95 = 10.526us
+        # target = 10.0, threshold = 0.95
+        # Gate fires when incumbent.objective_score.value <= 10.0 / 0.95 = 10.526
+        incumbent = _make_baseline(kernel_hash="best_hash", score_value=10.5)
         state = _make_state(
             current_round=5,
-            global_best_latency_us=10.5,
-            bottleneck_history=[["occupancy"]],
+            incumbent=incumbent,
+            bottleneck_history=[
+                BottleneckAssessment(
+                    tags=["occupancy"],
+                    primary_tag="occupancy",
+                    evidence={},
+                    rule_trace=[],
+                ),
+            ],
         )
         signals = _make_signals()
-        spec = _make_problem_spec(target_perf_us=10.0)
+        spec = _make_problem_spec(target_metric_value=10.0)
         config = NavigatorConfig(target_threshold=0.95)
 
         result = check_gates(signals, state, spec, config)
@@ -129,12 +192,13 @@ class TestGate3NearTarget:
         assert "near target" in result.reason.lower()
 
     def test_far_from_target_does_not_trigger(self) -> None:
+        incumbent = _make_baseline(kernel_hash="best_hash", score_value=50.0)
         state = _make_state(
             current_round=5,
-            global_best_latency_us=50.0,
+            incumbent=incumbent,
         )
         signals = _make_signals()
-        spec = _make_problem_spec(target_perf_us=10.0)
+        spec = _make_problem_spec(target_metric_value=10.0)
         config = NavigatorConfig(target_threshold=0.95)
 
         result = check_gates(signals, state, spec, config)
@@ -195,12 +259,13 @@ class TestNoMatch:
     """When no gate matches, result is None (proceed to LLM)."""
 
     def test_no_match_returns_none(self) -> None:
+        incumbent = _make_baseline(kernel_hash="best_hash", score_value=50.0)
         state = _make_state(
             current_round=5,
-            global_best_latency_us=50.0,
+            incumbent=incumbent,
         )
         signals = _make_signals()
-        spec = _make_problem_spec(target_perf_us=10.0)
+        spec = _make_problem_spec(target_metric_value=10.0)
         config = NavigatorConfig()
 
         result = check_gates(signals, state, spec, config)
@@ -213,17 +278,25 @@ class TestGatePriority:
 
     def test_near_target_beats_exhausted(self) -> None:
         # Both near target and exhausted conditions are true
+        incumbent = _make_baseline(kernel_hash="best_hash", score_value=10.5)
         state = _make_state(
             current_round=7,
-            global_best_latency_us=10.5,
-            bottleneck_history=[["occupancy"]],
+            incumbent=incumbent,
+            bottleneck_history=[
+                BottleneckAssessment(
+                    tags=["occupancy"],
+                    primary_tag="occupancy",
+                    evidence={},
+                    rule_trace=[],
+                ),
+            ],
         )
         signals = _make_signals(
             stable_bottleneck="reduce_register_pressure",
             exhausted_directions={"reduce_register_pressure"},
             direction_attempt_counts={"reduce_register_pressure": 3},
         )
-        spec = _make_problem_spec(target_perf_us=10.0)
+        spec = _make_problem_spec(target_metric_value=10.0)
         config = NavigatorConfig(target_threshold=0.95)
 
         result = check_gates(signals, state, spec, config)
@@ -235,16 +308,24 @@ class TestGatePriority:
 
     def test_plateau_beats_near_target(self) -> None:
         # Both plateau and near target conditions are true
+        incumbent = _make_baseline(kernel_hash="best_hash", score_value=10.5)
         state = _make_state(
             current_round=5,
-            global_best_latency_us=10.5,
-            bottleneck_history=[["memory_bandwidth"]],
+            incumbent=incumbent,
+            bottleneck_history=[
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+            ],
         )
         signals = _make_signals(
             is_plateau=True,
             consecutive_exploit_rounds=3,
         )
-        spec = _make_problem_spec(target_perf_us=10.0)
+        spec = _make_problem_spec(target_metric_value=10.0)
         config = NavigatorConfig(target_threshold=0.95)
 
         result = check_gates(signals, state, spec, config)

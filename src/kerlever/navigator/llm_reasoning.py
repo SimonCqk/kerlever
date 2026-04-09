@@ -19,6 +19,7 @@ from kerlever.types import (
     Mode,
     OptimizationState,
     SubMode,
+    TabuEntry,
 )
 
 _CONFIDENCE_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
@@ -87,10 +88,15 @@ def assemble_llm_context(
     """
     sections: list[str] = []
 
-    # 1. Current bottleneck tags
-    if state.bottleneck_history and state.bottleneck_history[-1]:
-        tags = ", ".join(state.bottleneck_history[-1])
-        sections.append(f"Current bottleneck tags: {tags}")
+    # 1. Current bottleneck assessment: primary_tag and evidence
+    if state.bottleneck_history:
+        latest = state.bottleneck_history[-1]
+        if latest.primary_tag is not None:
+            evidence_str = ", ".join(f"{k}={v:.4f}" for k, v in latest.evidence.items())
+            sections.append(
+                f"Current bottleneck: {latest.primary_tag}"
+                + (f" (evidence: {evidence_str})" if evidence_str else "")
+            )
 
     # 2. Performance trend
     trend_parts = [f"avg_delta={signals.avg_delta:.4f}"]
@@ -100,27 +106,33 @@ def assemble_llm_context(
         trend_parts.append("REGRESSION detected")
     sections.append(f"Performance trend: {', '.join(trend_parts)}")
 
-    # 3. Top-3 candidates by latency (from round summaries)
-    rounds_with_latency = [r for r in state.rounds if r.best_latency_us is not None]
-    rounds_with_latency.sort(key=lambda r: r.best_latency_us or float("inf"))
-    top3 = rounds_with_latency[:3]
+    # 3. Top-3 candidates by objective score (from round summaries)
+    rounds_with_score = [r for r in state.rounds if r.best_objective_score is not None]
+    rounds_with_score.sort(
+        key=lambda r: (
+            r.best_objective_score
+            if r.best_objective_score is not None
+            else float("inf")
+        )
+    )
+    top3 = rounds_with_score[:3]
     if top3:
         lines = []
         for r in top3:
             lines.append(
-                f"  Round {r.round_number}: {r.best_latency_us:.2f}us "
+                f"  Round {r.round_number}: score={r.best_objective_score:.4f} "
                 f"({r.mode.value} / {r.direction})"
             )
-        sections.append("Top-3 rounds by latency:\n" + "\n".join(lines))
+        sections.append("Top-3 rounds by objective score:\n" + "\n".join(lines))
 
     # 4. Last round info
     if state.rounds:
         last = state.rounds[-1]
-        imp = last.improvement_over_prev_best
-        imp_str = f"{imp:.4f}" if imp is not None else "none"
+        gain = last.rel_gain_vs_prev_best
+        gain_str = f"{gain:.4f}" if gain is not None else "none"
         sections.append(
             f"Last round: mode={last.mode.value}, direction={last.direction}, "
-            f"improvement={imp_str}"
+            f"rel_gain={gain_str}"
         )
 
     # 5. Exhausted directions
@@ -139,7 +151,7 @@ def assemble_llm_context(
             suggestions = cross_analysis.recombination_suggestions[:2]
             sections.append(f"Recombination suggestions: {'; '.join(suggestions)}")
 
-    # 7. Direction history
+    # 7. Direction history (from attempt records)
     if signals.direction_attempt_counts:
         dir_lines = [
             f"  {d}: {c} attempts"
@@ -147,11 +159,15 @@ def assemble_llm_context(
         ]
         sections.append("Direction history:\n" + "\n".join(dir_lines))
 
-    # Tabu list context (important for the LLM to avoid tabu directions)
-    if state.tabu_list:
-        sections.append(
-            f"Tabu list: {', '.join(state.tabu_list[-config.tabu_window :])}"
-        )
+    # Tabu entries context (important for the LLM to avoid tabu directions)
+    active_tabu = [
+        e for e in state.tabu_entries if e.expires_after_round >= state.current_round
+    ]
+    if active_tabu:
+        tabu_strs = [
+            f"{e.direction}(base={e.base_kernel_hash or 'any'})" for e in active_tabu
+        ]
+        sections.append(f"Active tabu entries: {', '.join(tabu_strs)}")
 
     # Join and truncate to budget (rough: 1 token ~= 4 chars)
     full_context = "\n\n".join(sections)
@@ -259,30 +275,45 @@ def parse_llm_decision(raw: str) -> LLMDecision:
 
 def validate_llm_decision(
     decision: LLMDecision,
-    tabu: list[str],
+    tabu_entries: list[TabuEntry],
     exhausted: set[str],
     config: NavigatorConfig,
+    *,
+    current_round: int = 0,
+    base_kernel_hash: str | None = None,
 ) -> str | None:
     """Validate an LLM decision against tabu and exhaustion constraints.
+
+    Tabu checking matches on (base_kernel_hash, direction) with expiry.
+    An entry is active when expires_after_round >= current_round.
 
     Returns None if the decision is valid, or a string describing the
     validation failure.
 
     Args:
         decision: Parsed LLM decision.
-        tabu: Current tabu list entries.
+        tabu_entries: Current TabuEntry records from optimization state.
         exhausted: Set of exhausted direction names.
         config: Navigator configuration.
+        current_round: Current optimization round for tabu expiry check.
+        base_kernel_hash: Current incumbent kernel hash for tabu matching.
 
     Returns:
         None if valid, error message string otherwise.
+
+    Invariant: INV-NAV-005 (tabu matches on base_hash + direction pair)
     """
-    # Check direction not in tabu list
-    if decision.direction in tabu:
-        return (
-            f"Direction {decision.direction!r} is in the tabu list. "
-            f"Choose a different direction."
-        )
+    # Check direction not blocked by active tabu entry for current base kernel
+    for entry in tabu_entries:
+        if (
+            entry.direction == decision.direction
+            and entry.base_kernel_hash == base_kernel_hash
+            and entry.expires_after_round >= current_round
+        ):
+            return (
+                f"Direction {decision.direction!r} is in the tabu list. "
+                f"Choose a different direction."
+            )
 
     # Check direction not exhausted
     if decision.direction in exhausted:
@@ -336,8 +367,12 @@ async def run_llm_reasoning(
     Invariant: INV-NAV-003 (LLM failures never stall the system)
     """
     context = assemble_llm_context(state, signals, cross_analysis, config)
-    tabu = list(state.tabu_list[-config.tabu_window :])
+    # Active tabu entries for validation
+    tabu_entries = [
+        e for e in state.tabu_entries if e.expires_after_round >= state.current_round
+    ]
     exhausted = signals.exhausted_directions
+    base_kernel_hash = state.incumbent.kernel_hash
 
     last_error = ""
 
@@ -359,7 +394,14 @@ async def run_llm_reasoning(
             decision = parse_llm_decision(raw_response)
 
             # Validate the parsed decision
-            error = validate_llm_decision(decision, tabu, exhausted, config)
+            error = validate_llm_decision(
+                decision,
+                tabu_entries,
+                exhausted,
+                config,
+                current_round=state.current_round,
+                base_kernel_hash=base_kernel_hash,
+            )
             if error is not None:
                 last_error = error
                 continue

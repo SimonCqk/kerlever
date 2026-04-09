@@ -98,10 +98,12 @@ def _gate_plateau(
     Implements: REQ-NAV-002, SCN-NAV-002-01
     """
     if signals.is_plateau:
-        # Use the latest round's bottleneck or generic direction
+        # Use the latest assessment's primary_tag or generic direction
         direction = "structural_change"
-        if state.bottleneck_history and state.bottleneck_history[-1]:
-            direction = state.bottleneck_history[-1][0]
+        if state.bottleneck_history:
+            tag = state.bottleneck_history[-1].primary_tag
+            if tag is not None:
+                direction = tag
 
         return GateResult(
             mode=Mode.EXPLORE,
@@ -120,29 +122,30 @@ def _gate_near_target(
     problem_spec: ProblemSpec,
     config: NavigatorConfig,
 ) -> GateResult | None:
-    """Gate 3: Near target — best latency within threshold of target.
+    """Gate 3: Near target — incumbent objective score within threshold of target.
 
-    Condition: best_latency <= target_perf_us / target_threshold
-    Since lower latency is better, this means the kernel is close to the goal.
+    Condition: incumbent.objective_score.value <= target_metric_value / target_threshold
+    Since lower objective score is better, this means the kernel is close to the goal.
 
     Implements: REQ-NAV-003, SCN-NAV-003-01
     """
-    if state.global_best_latency_us is None:
-        return None
+    incumbent_score = state.incumbent.objective_score.value
 
-    threshold_latency = problem_spec.target_perf_us / config.target_threshold
-    if state.global_best_latency_us <= threshold_latency:
-        # Use current bottleneck or generic direction
+    threshold_value = problem_spec.target_metric_value / config.target_threshold
+    if incumbent_score <= threshold_value:
+        # Use current bottleneck primary_tag or generic direction
         direction = "fine_tune"
-        if state.bottleneck_history and state.bottleneck_history[-1]:
-            direction = state.bottleneck_history[-1][0]
+        if state.bottleneck_history:
+            tag = state.bottleneck_history[-1].primary_tag
+            if tag is not None:
+                direction = tag
 
-        pct = problem_spec.target_perf_us / state.global_best_latency_us
+        pct = problem_spec.target_metric_value / incumbent_score
         return GateResult(
             mode=Mode.EXPLOIT,
             direction=direction,
             reason=(
-                f"Near target: current best is within {pct:.1%} of target, "
+                f"Near target: incumbent is within {pct:.1%} of target, "
                 f"fine-tuning only"
             ),
             sub_mode=SubMode.PARAM_SEARCH,

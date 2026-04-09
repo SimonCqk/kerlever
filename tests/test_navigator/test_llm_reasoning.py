@@ -19,29 +19,74 @@ from kerlever.navigator.llm_reasoning import (
     validate_llm_decision,
 )
 from kerlever.navigator.types import DerivedSignals, LLMDecision
-from kerlever.types import Mode, OptimizationState, ProblemSpec, SubMode
+from kerlever.types import (
+    BaselineArtifact,
+    Mode,
+    ObjectiveScore,
+    OptimizationState,
+    PerformanceObjective,
+    ProblemSpec,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
+    SubMode,
+    TabuEntry,
+)
 
 
 def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
         dtype="float32",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=10.0,
-        tolerance=0.05,
+        shape_cases=[ShapeCase(shape_id="s1", dims=[1024, 1024])],
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=10.0,
         max_rounds=20,
         reference_kernel="__global__ void k() {}",
     )
 
 
+def _make_baseline(
+    kernel_hash: str = "baseline_hash",
+    score_value: float = 100.0,
+) -> BaselineArtifact:
+    return BaselineArtifact(
+        kernel_hash=kernel_hash,
+        source_code="__global__ void k() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="s1",
+                latency_p50_us=score_value,
+                latency_p95_us=score_value * 1.1,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=score_value,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
+    )
+
+
 def _make_state(**kwargs: object) -> OptimizationState:
+    ps = _make_problem_spec()
+    bl = _make_baseline()
     defaults: dict[str, object] = {
-        "problem_spec": _make_problem_spec(),
+        "problem_spec": ps,
+        "baseline": bl,
+        "incumbent": bl,
         "current_round": 3,
         "rounds": [],
+        "attempts": [],
+        "tabu_entries": [],
         "bottleneck_history": [],
     }
     defaults.update(kwargs)
@@ -176,9 +221,53 @@ class TestValidateLLMDecision:
             confidence="high",
         )
         config = NavigatorConfig()
-        error = validate_llm_decision(decision, ["reduce_memory"], set(), config)
+        tabu_entries = [
+            TabuEntry(
+                base_kernel_hash="baseline_hash",
+                direction="reduce_memory",
+                sub_mode=None,
+                round_number=1,
+                expires_after_round=10,
+            ),
+        ]
+        error = validate_llm_decision(
+            decision,
+            tabu_entries,
+            set(),
+            config,
+            current_round=3,
+            base_kernel_hash="baseline_hash",
+        )
         assert error is not None
         assert "tabu" in error.lower()
+
+    def test_tabu_direction_different_base_hash_allowed(self) -> None:
+        """Same direction on different base kernel should not be blocked."""
+        decision = LLMDecision(
+            mode=Mode.EXPLOIT,
+            direction="reduce_memory",
+            reasoning="test",
+            confidence="high",
+        )
+        config = NavigatorConfig()
+        tabu_entries = [
+            TabuEntry(
+                base_kernel_hash="hash_A",
+                direction="reduce_memory",
+                sub_mode=None,
+                round_number=1,
+                expires_after_round=10,
+            ),
+        ]
+        error = validate_llm_decision(
+            decision,
+            tabu_entries,
+            set(),
+            config,
+            current_round=3,
+            base_kernel_hash="hash_B",
+        )
+        assert error is None
 
     def test_exhausted_direction_fails(self) -> None:
         decision = LLMDecision(
@@ -246,7 +335,15 @@ class TestRunLLMReasoningRetry:
         valid_response = _valid_llm_response(direction="optimize_shared_memory")
         client = StubLLMClient([tabu_response, valid_response])
         state = _make_state(
-            tabu_list=["reduce_memory"],
+            tabu_entries=[
+                TabuEntry(
+                    base_kernel_hash="baseline_hash",
+                    direction="reduce_memory",
+                    sub_mode=None,
+                    round_number=1,
+                    expires_after_round=10,
+                ),
+            ],
         )
         signals = _make_signals()
         config = NavigatorConfig()
@@ -286,7 +383,17 @@ class TestRunLLMReasoningDoubleFailure:
     async def test_double_tabu_raises(self) -> None:
         tabu_resp = _valid_llm_response(direction="blocked_dir")
         client = StubLLMClient([tabu_resp, tabu_resp])
-        state = _make_state(tabu_list=["blocked_dir"])
+        state = _make_state(
+            tabu_entries=[
+                TabuEntry(
+                    base_kernel_hash="baseline_hash",
+                    direction="blocked_dir",
+                    sub_mode=None,
+                    round_number=1,
+                    expires_after_round=10,
+                ),
+            ],
+        )
         signals = _make_signals()
         config = NavigatorConfig()
 

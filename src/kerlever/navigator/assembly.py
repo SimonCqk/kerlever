@@ -16,6 +16,7 @@ from kerlever.types import (
     OptimizationState,
     StrategyDirective,
     SubMode,
+    TabuEntry,
 )
 
 
@@ -57,9 +58,9 @@ def assemble_directive(
     reason = decision.reason if isinstance(decision, GateResult) else decision.reasoning
 
     # Step 2: Apply tabu filter
-    # Check whether (base_kernel_hash, direction) pair is in tabu
-    base_hash = state.global_best_hash if mode == Mode.EXPLOIT else None
-    if base_hash is not None and _is_tabu(base_hash, direction, state, config):
+    # Check whether (base_kernel_hash, direction) pair is in active tabu entries
+    base_hash = state.incumbent.kernel_hash if mode == Mode.EXPLOIT else None
+    if base_hash is not None and _is_tabu(base_hash, direction, state):
         # The direction is tabu for this base kernel — note in reason
         reason = f"{reason} (note: direction was tabu for current base kernel)"
 
@@ -71,7 +72,7 @@ def assemble_directive(
 
     # Step 4: Set base kernel hash
     if mode == Mode.EXPLOIT:
-        base_kernel_hash = state.global_best_hash
+        base_kernel_hash: str | None = state.incumbent.kernel_hash
     elif sub_mode == SubMode.DE_NOVO or sub_mode == SubMode.RECOMBINATION:
         base_kernel_hash = None
     else:
@@ -110,8 +111,10 @@ def assemble_directive(
         # Hardware constraints apply to explore mode too
         hard_constraints = _derive_hard_constraints()
 
-    # Step 6: Assemble tabu list for output (windowed to last W rounds)
-    tabu_output = list(state.tabu_list[-config.tabu_window :])
+    # Step 6: Assemble active tabu entries for output
+    tabu_output: list[TabuEntry] = [
+        e for e in state.tabu_entries if e.expires_after_round >= state.current_round
+    ]
 
     # Step 7: Construct and return StrategyDirective
     return StrategyDirective(
@@ -133,43 +136,21 @@ def _is_tabu(
     base_hash: str,
     direction: str,
     state: OptimizationState,
-    config: NavigatorConfig,
 ) -> bool:
-    """Check if a (base_hash, direction) pair is in the tabu list.
+    """Check if a (base_hash, direction) pair is blocked by an active TabuEntry.
 
-    The tabu list stores intent_tags from recent rounds. We check if
-    the proposed direction, combined with the base kernel hash, was
-    tried within the tabu window.
+    An entry is active when expires_after_round >= current_round.
+    Matching is on both base_kernel_hash and direction.
 
-    Tabu matching uses the rounds history since the tabu_list in
-    OptimizationState stores intent_tags (not direction+hash pairs).
-    We check recent rounds for a matching (base_kernel_hash, direction) pair.
+    Invariant: INV-NAV-005 (tabu matches on base_hash + direction pair)
     """
-    window = config.tabu_window
-    recent_rounds = state.rounds[-window:] if state.rounds else []
-
-    for r in recent_rounds:
-        if r.direction == direction:
-            # Check if this round's base kernel matches
-            # The round summary doesn't carry base_kernel_hash directly,
-            # so we approximate: if the direction was used recently, it's tabu
-            # for the same base kernel. This is a simplification per spec §6.5
-            # Step 2 which says "check whether the (base_kernel_hash, direction)
-            # pair exists in the tabu list within the tabu window."
-            # Since RoundSummary doesn't carry base_kernel_hash, we use the
-            # decision_log for the pairing check.
-            pass
-
-    # Check decision_log for exact (base_hash, direction) pair matches
-    recent_decisions = state.decision_log[-window:] if state.decision_log else []
-    for entry in recent_decisions:
-        directive_info = entry.get("directive")
-        if isinstance(directive_info, dict):
-            entry_direction = directive_info.get("direction")
-            # The decision_log doesn't store base_kernel_hash either,
-            # so we check against the intent_tag list for the direction
-            if entry_direction == direction:
-                return True
+    for entry in state.tabu_entries:
+        if (
+            entry.base_kernel_hash == base_hash
+            and entry.direction == direction
+            and entry.expires_after_round >= state.current_round
+        ):
+            return True
 
     return False
 
@@ -263,13 +244,10 @@ def _derive_parent_candidates(
     if cross_analysis is not None and cross_analysis.winning_genes:
         parents.extend(cross_analysis.winning_genes[:2])
 
-    # Supplement from global best if needed
-    if (
-        len(parents) < 2
-        and state.global_best_hash is not None
-        and state.global_best_hash not in parents
-    ):
-        parents.append(state.global_best_hash)
+    # Supplement from incumbent if needed
+    incumbent_hash = state.incumbent.kernel_hash
+    if len(parents) < 2 and incumbent_hash not in parents:
+        parents.append(incumbent_hash)
 
     return parents if parents else []
 

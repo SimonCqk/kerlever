@@ -9,11 +9,18 @@ from kerlever.navigator.assembly import assemble_directive
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.navigator.types import GateResult, LLMDecision
 from kerlever.types import (
+    BaselineArtifact,
     CrossCandidateAnalysis,
     Mode,
+    ObjectiveScore,
     OptimizationState,
+    PerformanceObjective,
     ProblemSpec,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
     SubMode,
+    TabuEntry,
 )
 
 
@@ -21,23 +28,56 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
         dtype="float32",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=10.0,
-        tolerance=0.05,
+        shape_cases=[ShapeCase(shape_id="s1", dims=[1024, 1024])],
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=10.0,
         max_rounds=20,
         reference_kernel="__global__ void k() {}",
     )
 
 
+def _make_baseline(
+    kernel_hash: str = "abc123",
+    score_value: float = 20.0,
+) -> BaselineArtifact:
+    return BaselineArtifact(
+        kernel_hash=kernel_hash,
+        source_code="__global__ void k() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="s1",
+                latency_p50_us=score_value,
+                latency_p95_us=score_value * 1.1,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=score_value,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
+    )
+
+
 def _make_state(**kwargs: object) -> OptimizationState:
+    ps = _make_problem_spec()
+    bl = _make_baseline()
     defaults: dict[str, object] = {
-        "problem_spec": _make_problem_spec(),
+        "problem_spec": ps,
+        "baseline": bl,
+        "incumbent": bl,
         "current_round": 3,
-        "global_best_hash": "abc123",
-        "global_best_latency_us": 20.0,
+        "rounds": [],
+        "attempts": [],
+        "tabu_entries": [],
+        "bottleneck_history": [],
     }
     defaults.update(kwargs)
     return OptimizationState(**defaults)  # type: ignore[arg-type]
@@ -172,35 +212,59 @@ class TestTabuFilter:
             reasoning="test",
             confidence="high",
         )
-        # The tabu list has this direction from a recent round
-        # but the base kernel is different
+        # The tabu has this direction for a different base kernel hash
+        incumbent = _make_baseline(kernel_hash="hash_B")
         state = _make_state(
-            global_best_hash="hash_B",
-            decision_log=[
-                {
-                    "round_number": 1,
-                    "directive": {
-                        "mode": "EXPLOIT",
-                        "direction": "reduce_register_pressure",
-                        "reason": "test",
-                        "num_candidates": 3,
-                    },
-                }
+            incumbent=incumbent,
+            tabu_entries=[
+                TabuEntry(
+                    base_kernel_hash="hash_A",
+                    direction="reduce_register_pressure",
+                    sub_mode=None,
+                    round_number=1,
+                    expires_after_round=10,
+                ),
             ],
         )
         config = NavigatorConfig()
 
         directive = assemble_directive(decision, state, None, config)
 
-        # Should proceed (different hash) — but the current
-        # implementation notes in reason when tabu triggers
+        # Should proceed (different hash)
         assert directive.direction == "reduce_register_pressure"
+        # Should NOT have the tabu note in reason
+        assert "tabu" not in directive.reason.lower()
+
+    def test_same_direction_same_hash_noted(self) -> None:
+        """Same direction on same base kernel is noted in reason."""
+        decision = LLMDecision(
+            mode=Mode.EXPLOIT,
+            direction="reduce_register_pressure",
+            reasoning="test",
+            confidence="high",
+        )
+        state = _make_state(
+            tabu_entries=[
+                TabuEntry(
+                    base_kernel_hash="abc123",
+                    direction="reduce_register_pressure",
+                    sub_mode=None,
+                    round_number=1,
+                    expires_after_round=10,
+                ),
+            ],
+        )
+        config = NavigatorConfig()
+
+        directive = assemble_directive(decision, state, None, config)
+
+        assert "tabu" in directive.reason.lower()
 
 
 class TestTabuListOutput:
-    """Tabu list on directive is windowed to last W rounds."""
+    """Tabu entries on directive contain only active entries."""
 
-    def test_tabu_windowed(self) -> None:
+    def test_active_tabu_entries_only(self) -> None:
         decision = GateResult(
             mode=Mode.EXPLORE,
             direction="initial_exploration",
@@ -208,14 +272,39 @@ class TestTabuListOutput:
             sub_mode=SubMode.DE_NOVO,
         )
         state = _make_state(
-            tabu_list=["a", "b", "c", "d", "e", "f", "g"],
+            current_round=5,
+            tabu_entries=[
+                TabuEntry(
+                    base_kernel_hash="h1",
+                    direction="d1",
+                    sub_mode=None,
+                    round_number=1,
+                    expires_after_round=3,  # expired
+                ),
+                TabuEntry(
+                    base_kernel_hash="h2",
+                    direction="d2",
+                    sub_mode=None,
+                    round_number=2,
+                    expires_after_round=7,  # active
+                ),
+                TabuEntry(
+                    base_kernel_hash="h3",
+                    direction="d3",
+                    sub_mode=None,
+                    round_number=3,
+                    expires_after_round=5,  # active (exactly current round)
+                ),
+            ],
         )
-        config = NavigatorConfig(tabu_window=5)
+        config = NavigatorConfig()
 
         directive = assemble_directive(decision, state, None, config)
 
-        # Should only include the last 5 entries
-        assert directive.tabu == ["c", "d", "e", "f", "g"]
+        # Should only include active entries (expires_after_round >= 5)
+        assert len(directive.tabu) == 2
+        tabu_directions = {e.direction for e in directive.tabu}
+        assert tabu_directions == {"d2", "d3"}
 
 
 class TestHardConstraints:

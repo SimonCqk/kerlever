@@ -25,6 +25,7 @@ from kerlever.types import (
     RoundSummary,
     StrategyDirective,
     SubMode,
+    TabuEntry,
 )
 
 __all__ = ["StrategyNavigator"]
@@ -191,12 +192,15 @@ def _safe_directive(
 
     Per spec §6.6 Error Handling: EXPLORE mode, DE_NOVO, generic direction.
     """
+    active_tabu: list[TabuEntry] = [
+        e for e in state.tabu_entries if e.expires_after_round >= state.current_round
+    ]
     return StrategyDirective(
         mode=Mode.EXPLORE,
         direction="initial_exploration",
         reason="Safe fallback: assembly error occurred",
         base_kernel_hash=None,
         num_candidates=config.explore_candidates,
-        tabu=list(state.tabu_list[-config.tabu_window :]),
+        tabu=active_tabu,
         sub_mode=SubMode.DE_NOVO,
     )

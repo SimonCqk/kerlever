@@ -17,29 +17,33 @@ from kerlever.types import OptimizationState
 
 
 def compute_direction_stats(state: OptimizationState) -> list[DirectionStats]:
-    """Compute per-direction performance statistics from round history.
+    """Compute per-direction performance statistics from attempt records.
 
-    For each unique direction in the round summaries, computes visits,
-    total performance gain, and average performance gain. None values
-    in improvement_over_prev_best are treated as 0.0.
+    For each unique direction across all AttemptRecord entries, computes
+    visits, total relative performance gain (from the corresponding
+    RoundSummary's rel_gain_vs_prev_best), and average gain. None values
+    are treated as 0.0.
 
     Args:
-        state: Full optimization state with rounds history.
+        state: Full optimization state with attempts and rounds history.
 
     Returns:
         List of DirectionStats, one per unique direction.
     """
+    # Build round-number -> rel_gain lookup from round summaries
+    round_gain: dict[int, float] = {}
+    for r in state.rounds:
+        round_gain[r.round_number] = (
+            r.rel_gain_vs_prev_best if r.rel_gain_vs_prev_best is not None else 0.0
+        )
+
     visits: dict[str, int] = {}
     total_gain: dict[str, float] = {}
 
-    for r in state.rounds:
-        direction = r.direction
+    for attempt in state.attempts:
+        direction = attempt.direction
         visits[direction] = visits.get(direction, 0) + 1
-        gain = (
-            r.improvement_over_prev_best
-            if r.improvement_over_prev_best is not None
-            else 0.0
-        )
+        gain = round_gain.get(attempt.round_number, 0.0)
         total_gain[direction] = total_gain.get(direction, 0.0) + gain
 
     stats: list[DirectionStats] = []

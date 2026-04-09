@@ -8,8 +8,6 @@ Spec: docs/navigator/spec.md §6.1
 
 from __future__ import annotations
 
-from collections import Counter
-
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.navigator.types import DerivedSignals
 from kerlever.types import Mode, OptimizationState
@@ -62,9 +60,9 @@ def _compute_avg_delta(
     state: OptimizationState,
     config: NavigatorConfig,
 ) -> float:
-    """Compute average improvement over the last N rounds.
+    """Compute average relative gain over the last N rounds.
 
-    Collects improvement_over_prev_best from the most recent
+    Collects rel_gain_vs_prev_best from the most recent
     plateau_rounds entries. None values are treated as 0.0.
     Returns 0.0 when the rounds list is empty.
     """
@@ -73,9 +71,7 @@ def _compute_avg_delta(
 
     recent = state.rounds[-config.plateau_rounds :]
     deltas = [
-        r.improvement_over_prev_best
-        if r.improvement_over_prev_best is not None
-        else 0.0
+        r.rel_gain_vs_prev_best if r.rel_gain_vs_prev_best is not None else 0.0
         for r in recent
     ]
     if not deltas:
@@ -102,14 +98,13 @@ def _compute_stable_bottleneck(
     state: OptimizationState,
     config: NavigatorConfig,
 ) -> str | None:
-    """Find a stable bottleneck tag across the last K rounds.
+    """Find a stable bottleneck primary_tag across the last K assessments.
 
-    A bottleneck is stable if all K rounds share at least one common tag
-    (intersection of the K tag lists is non-empty). If multiple tags are
-    common, the one with the highest frequency across all K lists wins.
+    A bottleneck is stable if all K most recent BottleneckAssessment entries
+    share the same primary_tag (and it is not None).
 
-    Returns None if fewer than K rounds of history exist or any of the
-    K lists is empty.
+    Returns None if fewer than K assessments exist or any has
+    primary_tag = None.
     """
     k = config.stable_rounds
     history = state.bottleneck_history
@@ -119,59 +114,50 @@ def _compute_stable_bottleneck(
 
     last_k = history[-k:]
 
-    # Any empty list breaks the streak
-    for tags in last_k:
-        if not tags:
-            return None
-
-    # Find common tags across all K rounds
-    common = set(last_k[0])
-    for tags in last_k[1:]:
-        common &= set(tags)
-
-    if not common:
+    # All K assessments must have the same non-None primary_tag
+    first_tag = last_k[0].primary_tag
+    if first_tag is None:
         return None
 
-    # Among common tags, pick the most frequent across all K lists
-    counter: Counter[str] = Counter()
-    for tags in last_k:
-        for tag in tags:
-            if tag in common:
-                counter[tag] += 1
+    for assessment in last_k[1:]:
+        if assessment.primary_tag != first_tag:
+            return None
 
-    # most_common returns in descending order; first is the most frequent
-    return counter.most_common(1)[0][0]
+    return first_tag
 
 
 def _compute_new_bottleneck(state: OptimizationState) -> str | None:
-    """Find a bottleneck tag from the latest round not seen in any prior round.
+    """Find a new primary_tag from the latest BottleneckAssessment.
 
-    Returns None on round 0 (no history), when the latest round has no tags,
-    or when all tags have been seen before.
+    Compares the latest assessment's primary_tag against all prior
+    assessments' primary_tag values. Returns the tag if it was never
+    seen as a primary_tag before, else None.
+
+    Returns None on round 0 (no history), when the latest assessment
+    has primary_tag = None, or when the tag has been seen before.
     """
     history = state.bottleneck_history
 
     if not history:
         return None
 
-    latest_tags = history[-1]
-    if not latest_tags:
+    latest_tag = history[-1].primary_tag
+    if latest_tag is None:
         return None
 
-    # Collect all tags from prior rounds (everything except the latest)
-    prior_tags: set[str] = set()
-    for tags in history[:-1]:
-        prior_tags.update(tags)
+    # Collect all primary_tags from prior assessments
+    prior_tags: set[str | None] = set()
+    for assessment in history[:-1]:
+        prior_tags.add(assessment.primary_tag)
 
     # Spec: "On round 0 (no history at all), new_bottleneck = None"
     # Empty history is handled above. If history has 1 entry,
-    # prior_tags is empty so all latest tags are "new". This is
+    # prior_tags is empty so the latest primary_tag is "new". This is
     # correct because the orchestrator appends history after each
     # round, so 1 entry means current_round >= 1.
 
-    for tag in latest_tags:
-        if tag not in prior_tags:
-            return tag
+    if latest_tag not in prior_tags:
+        return latest_tag
 
     return None
 
@@ -179,13 +165,15 @@ def _compute_new_bottleneck(state: OptimizationState) -> str | None:
 def _compute_direction_attempt_counts(
     state: OptimizationState,
 ) -> dict[str, int]:
-    """Count how many rounds used each direction.
+    """Count how many attempts used each direction.
 
-    Iterates over all round summaries and tallies each direction value.
+    Iterates over all AttemptRecord entries in state.attempts and
+    tallies each direction value. This uses typed attempt records
+    rather than round summaries for more accurate counting.
     """
     counts: dict[str, int] = {}
-    for r in state.rounds:
-        counts[r.direction] = counts.get(r.direction, 0) + 1
+    for attempt in state.attempts:
+        counts[attempt.direction] = counts.get(attempt.direction, 0) + 1
     return counts
 
 

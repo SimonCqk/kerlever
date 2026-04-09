@@ -14,10 +14,17 @@ import pytest
 from kerlever.navigator import StrategyNavigator
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.types import (
+    BaselineArtifact,
+    BottleneckAssessment,
     Mode,
+    ObjectiveScore,
     OptimizationState,
+    PerformanceObjective,
     ProblemSpec,
     RoundSummary,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
     SubMode,
 )
 
@@ -26,21 +33,56 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
         dtype="float32",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=10.0,
-        tolerance=0.05,
+        shape_cases=[ShapeCase(shape_id="s1", dims=[1024, 1024])],
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=10.0,
         max_rounds=20,
         reference_kernel="__global__ void k() {}",
     )
 
 
+def _make_baseline(
+    kernel_hash: str = "baseline_hash",
+    score_value: float = 100.0,
+) -> BaselineArtifact:
+    return BaselineArtifact(
+        kernel_hash=kernel_hash,
+        source_code="__global__ void k() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="s1",
+                latency_p50_us=score_value,
+                latency_p95_us=score_value * 1.1,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=score_value,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
+    )
+
+
 def _make_state(**kwargs: object) -> OptimizationState:
+    ps = _make_problem_spec()
+    bl = _make_baseline()
     defaults: dict[str, object] = {
-        "problem_spec": _make_problem_spec(),
+        "problem_spec": ps,
+        "baseline": bl,
+        "incumbent": bl,
         "current_round": 0,
+        "rounds": [],
+        "attempts": [],
+        "tabu_entries": [],
+        "bottleneck_history": [],
     }
     defaults.update(kwargs)
     return OptimizationState(**defaults)  # type: ignore[arg-type]
@@ -105,6 +147,7 @@ class TestMultiRoundSequence:
         assert d0.sub_mode == SubMode.DE_NOVO
 
         # Round 1-3: exploit with small improvements
+        incumbent = _make_baseline(kernel_hash="hash_best", score_value=78.5)
         rounds = [
             RoundSummary(
                 round_number=0,
@@ -112,8 +155,8 @@ class TestMultiRoundSequence:
                 direction="initial_exploration",
                 num_candidates=3,
                 num_improved=1,
-                best_latency_us=80.0,
-                improvement_over_prev_best=20.0,
+                best_objective_score=80.0,
+                rel_gain_vs_prev_best=0.20,
             ),
             RoundSummary(
                 round_number=1,
@@ -121,8 +164,8 @@ class TestMultiRoundSequence:
                 direction="reduce_memory_bandwidth",
                 num_candidates=5,
                 num_improved=1,
-                best_latency_us=79.0,
-                improvement_over_prev_best=0.01,
+                best_objective_score=79.0,
+                rel_gain_vs_prev_best=0.01,
             ),
             RoundSummary(
                 round_number=2,
@@ -130,8 +173,8 @@ class TestMultiRoundSequence:
                 direction="reduce_memory_bandwidth",
                 num_candidates=5,
                 num_improved=1,
-                best_latency_us=78.5,
-                improvement_over_prev_best=0.005,
+                best_objective_score=78.5,
+                rel_gain_vs_prev_best=0.005,
             ),
             RoundSummary(
                 round_number=3,
@@ -139,20 +182,39 @@ class TestMultiRoundSequence:
                 direction="reduce_memory_bandwidth",
                 num_candidates=5,
                 num_improved=0,
-                best_latency_us=78.5,
-                improvement_over_prev_best=0.0,
+                best_objective_score=78.5,
+                rel_gain_vs_prev_best=0.0,
             ),
         ]
         state_4 = _make_state(
             current_round=4,
+            incumbent=incumbent,
             rounds=rounds,
-            global_best_hash="hash_best",
-            global_best_latency_us=78.5,
             bottleneck_history=[
-                ["memory_bandwidth"],
-                ["memory_bandwidth"],
-                ["memory_bandwidth"],
-                ["memory_bandwidth"],
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
             ],
         )
 
@@ -175,6 +237,7 @@ class TestLLMFailureFallback:
         spec = _make_problem_spec()
 
         # State with some history (not round 0, no gate matches)
+        incumbent = _make_baseline(kernel_hash="hash_0", score_value=80.0)
         rounds = [
             RoundSummary(
                 round_number=0,
@@ -182,16 +245,22 @@ class TestLLMFailureFallback:
                 direction="initial_exploration",
                 num_candidates=3,
                 num_improved=1,
-                best_latency_us=80.0,
-                improvement_over_prev_best=20.0,
+                best_objective_score=80.0,
+                rel_gain_vs_prev_best=0.20,
             ),
         ]
         state = _make_state(
             current_round=1,
+            incumbent=incumbent,
             rounds=rounds,
-            global_best_hash="hash_0",
-            global_best_latency_us=80.0,
-            bottleneck_history=[["memory_bandwidth"]],
+            bottleneck_history=[
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+            ],
         )
 
         directive = await navigator.decide(spec, state, rounds[0], None)
@@ -210,6 +279,7 @@ class TestNoLLMClient:
         spec = _make_problem_spec()
 
         # State with history, no gate matches
+        incumbent = _make_baseline(kernel_hash="hash_0", score_value=80.0)
         rounds = [
             RoundSummary(
                 round_number=0,
@@ -217,16 +287,22 @@ class TestNoLLMClient:
                 direction="initial_exploration",
                 num_candidates=3,
                 num_improved=1,
-                best_latency_us=80.0,
-                improvement_over_prev_best=20.0,
+                best_objective_score=80.0,
+                rel_gain_vs_prev_best=0.20,
             ),
         ]
         state = _make_state(
             current_round=1,
+            incumbent=incumbent,
             rounds=rounds,
-            global_best_hash="hash_0",
-            global_best_latency_us=80.0,
-            bottleneck_history=[["memory_bandwidth"]],
+            bottleneck_history=[
+                BottleneckAssessment(
+                    tags=["memory_bandwidth"],
+                    primary_tag="memory_bandwidth",
+                    evidence={},
+                    rule_trace=[],
+                ),
+            ],
         )
 
         directive = await navigator.decide(spec, state, rounds[0], None)

@@ -7,7 +7,21 @@ from __future__ import annotations
 
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.navigator.signals import compute_derived_signals
-from kerlever.types import Mode, OptimizationState, ProblemSpec, RoundSummary
+from kerlever.types import (
+    AttemptRecord,
+    BaselineArtifact,
+    BottleneckAssessment,
+    CandidateOutcome,
+    Mode,
+    ObjectiveScore,
+    OptimizationState,
+    PerformanceObjective,
+    ProblemSpec,
+    RoundSummary,
+    ShapeBenchResult,
+    ShapeCase,
+    StaticAnalysis,
+)
 
 
 def _make_problem_spec() -> ProblemSpec:
@@ -15,23 +29,59 @@ def _make_problem_spec() -> ProblemSpec:
     return ProblemSpec(
         op_name="matmul",
         op_semantics="C = A @ B",
-        shapes=[[1024, 1024], [1024, 1024]],
         dtype="float32",
         target_gpu="A100",
-        baseline_perf_us=100.0,
-        target_perf_us=10.0,
-        tolerance=0.05,
+        shape_cases=[
+            ShapeCase(shape_id="s1", dims=[1024, 1024]),
+        ],
+        objective=PerformanceObjective(
+            primary_metric="weighted_p50_us",
+            aggregation="weighted_mean",
+        ),
+        target_metric_value=10.0,
         max_rounds=20,
         reference_kernel="__global__ void k() {}",
     )
 
 
+def _make_baseline(
+    kernel_hash: str = "baseline_hash",
+    score_value: float = 100.0,
+) -> BaselineArtifact:
+    """Create a minimal BaselineArtifact for testing."""
+    return BaselineArtifact(
+        kernel_hash=kernel_hash,
+        source_code="__global__ void k() {}",
+        compile_artifact=StaticAnalysis(),
+        benchmark_results=[
+            ShapeBenchResult(
+                shape_id="s1",
+                latency_p50_us=score_value,
+                latency_p95_us=score_value * 1.1,
+                run_count=10,
+            ),
+        ],
+        objective_score=ObjectiveScore(
+            metric_name="weighted_p50_us",
+            value=score_value,
+            relative_to_baseline=1.0,
+            relative_to_incumbent=1.0,
+        ),
+    )
+
+
 def _make_state(**kwargs: object) -> OptimizationState:
     """Create an OptimizationState with overrides."""
+    ps = _make_problem_spec()
+    bl = _make_baseline()
     defaults: dict[str, object] = {
-        "problem_spec": _make_problem_spec(),
+        "problem_spec": ps,
+        "baseline": bl,
+        "incumbent": bl,
         "current_round": 0,
         "rounds": [],
+        "attempts": [],
+        "tabu_entries": [],
         "bottleneck_history": [],
     }
     defaults.update(kwargs)
@@ -42,7 +92,7 @@ def _make_round(
     round_number: int,
     mode: Mode,
     direction: str,
-    improvement: float | None = None,
+    rel_gain: float | None = None,
 ) -> RoundSummary:
     """Create a RoundSummary."""
     return RoundSummary(
@@ -51,8 +101,37 @@ def _make_round(
         direction=direction,
         num_candidates=3,
         num_improved=1,
-        best_latency_us=50.0,
-        improvement_over_prev_best=improvement,
+        best_objective_score=50.0,
+        rel_gain_vs_prev_best=rel_gain,
+    )
+
+
+def _make_attempt(
+    round_number: int,
+    direction: str,
+    outcome: CandidateOutcome = CandidateOutcome.IMPROVED,
+) -> AttemptRecord:
+    """Create an AttemptRecord."""
+    return AttemptRecord(
+        round_number=round_number,
+        candidate_hash=f"hash_{round_number}",
+        base_kernel_hash="baseline_hash",
+        direction=direction,
+        sub_mode=None,
+        outcome=outcome,
+    )
+
+
+def _make_assessment(
+    primary_tag: str | None,
+    tags: list[str] | None = None,
+) -> BottleneckAssessment:
+    """Create a BottleneckAssessment."""
+    return BottleneckAssessment(
+        tags=tags if tags is not None else ([primary_tag] if primary_tag else []),
+        primary_tag=primary_tag,
+        evidence={},
+        rule_trace=[],
     )
 
 
@@ -141,13 +220,13 @@ class TestPlateau:
 
 
 class TestStableBottleneck:
-    """Stable bottleneck: same tag for K consecutive rounds."""
+    """Stable bottleneck: same primary_tag for K consecutive assessments."""
 
     def test_three_rounds_same_bottleneck(self) -> None:
         history = [
-            ["memory_bandwidth"],
-            ["memory_bandwidth"],
-            ["memory_bandwidth"],
+            _make_assessment("memory_bandwidth"),
+            _make_assessment("memory_bandwidth"),
+            _make_assessment("memory_bandwidth"),
         ]
         state = _make_state(
             current_round=3,
@@ -160,9 +239,9 @@ class TestStableBottleneck:
 
     def test_different_bottlenecks_no_stable(self) -> None:
         history = [
-            ["memory_bandwidth"],
-            ["occupancy"],
-            ["memory_bandwidth"],
+            _make_assessment("memory_bandwidth"),
+            _make_assessment("occupancy"),
+            _make_assessment("memory_bandwidth"),
         ]
         state = _make_state(
             current_round=3,
@@ -174,7 +253,10 @@ class TestStableBottleneck:
         assert signals.stable_bottleneck is None
 
     def test_fewer_than_k_rounds_no_stable(self) -> None:
-        history = [["memory_bandwidth"], ["memory_bandwidth"]]
+        history = [
+            _make_assessment("memory_bandwidth"),
+            _make_assessment("memory_bandwidth"),
+        ]
         state = _make_state(
             current_round=2,
             bottleneck_history=history,
@@ -184,11 +266,11 @@ class TestStableBottleneck:
         signals = compute_derived_signals(state, config)
         assert signals.stable_bottleneck is None
 
-    def test_empty_bottleneck_round_breaks_streak(self) -> None:
+    def test_none_primary_tag_breaks_streak(self) -> None:
         history = [
-            ["memory_bandwidth"],
-            [],
-            ["memory_bandwidth"],
+            _make_assessment("memory_bandwidth"),
+            _make_assessment(None),
+            _make_assessment("memory_bandwidth"),
         ]
         state = _make_state(
             current_round=3,
@@ -201,12 +283,12 @@ class TestStableBottleneck:
 
 
 class TestNewBottleneck:
-    """New bottleneck: a tag in the latest round never seen before."""
+    """New bottleneck: a primary_tag in the latest assessment never seen before."""
 
     def test_new_tag_detected(self) -> None:
         history = [
-            ["memory_bandwidth"],
-            ["memory_bandwidth", "tensor_core_not_triggered"],
+            _make_assessment("memory_bandwidth"),
+            _make_assessment("tensor_core_not_triggered"),
         ]
         state = _make_state(
             current_round=2,
@@ -218,8 +300,8 @@ class TestNewBottleneck:
 
     def test_no_new_tag(self) -> None:
         history = [
-            ["memory_bandwidth", "occupancy"],
-            ["memory_bandwidth"],
+            _make_assessment("memory_bandwidth"),
+            _make_assessment("memory_bandwidth"),
         ]
         state = _make_state(
             current_round=2,
@@ -231,16 +313,16 @@ class TestNewBottleneck:
 
 
 class TestDirectionAttemptCounts:
-    """Direction attempt counting across all rounds."""
+    """Direction attempt counting from AttemptRecord entries."""
 
     def test_direction_counts(self) -> None:
-        rounds = [
-            _make_round(0, Mode.EXPLOIT, "reduce_memory"),
-            _make_round(1, Mode.EXPLOIT, "reduce_memory"),
-            _make_round(2, Mode.EXPLORE, "structural_change"),
-            _make_round(3, Mode.EXPLOIT, "reduce_memory"),
+        attempts = [
+            _make_attempt(0, "reduce_memory"),
+            _make_attempt(1, "reduce_memory"),
+            _make_attempt(2, "structural_change"),
+            _make_attempt(3, "reduce_memory"),
         ]
-        state = _make_state(current_round=4, rounds=rounds)
+        state = _make_state(current_round=4, attempts=attempts)
         signals = compute_derived_signals(state, NavigatorConfig())
         assert signals.direction_attempt_counts == {
             "reduce_memory": 3,
@@ -253,18 +335,18 @@ class TestExhaustedDirections:
 
     def test_exhausted_when_stable_and_max_attempts(self) -> None:
         history = [
-            ["reduce_memory"],
-            ["reduce_memory"],
-            ["reduce_memory"],
+            _make_assessment("reduce_memory"),
+            _make_assessment("reduce_memory"),
+            _make_assessment("reduce_memory"),
         ]
-        rounds = [
-            _make_round(0, Mode.EXPLOIT, "reduce_memory", 0.01),
-            _make_round(1, Mode.EXPLOIT, "reduce_memory", 0.005),
-            _make_round(2, Mode.EXPLOIT, "reduce_memory", 0.003),
+        attempts = [
+            _make_attempt(0, "reduce_memory"),
+            _make_attempt(1, "reduce_memory"),
+            _make_attempt(2, "reduce_memory"),
         ]
         state = _make_state(
             current_round=3,
-            rounds=rounds,
+            attempts=attempts,
             bottleneck_history=history,
         )
         config = NavigatorConfig(
@@ -276,17 +358,17 @@ class TestExhaustedDirections:
 
     def test_not_exhausted_with_fewer_attempts(self) -> None:
         history = [
-            ["reduce_memory"],
-            ["reduce_memory"],
-            ["reduce_memory"],
+            _make_assessment("reduce_memory"),
+            _make_assessment("reduce_memory"),
+            _make_assessment("reduce_memory"),
         ]
-        rounds = [
-            _make_round(0, Mode.EXPLOIT, "reduce_memory", 0.01),
-            _make_round(1, Mode.EXPLOIT, "reduce_memory", 0.005),
+        attempts = [
+            _make_attempt(0, "reduce_memory"),
+            _make_attempt(1, "reduce_memory"),
         ]
         state = _make_state(
             current_round=2,
-            rounds=rounds,
+            attempts=attempts,
             bottleneck_history=history,
         )
         config = NavigatorConfig(
@@ -298,7 +380,7 @@ class TestExhaustedDirections:
 
 
 class TestNoneImprovementTreatedAsZero:
-    """None improvement values should be treated as 0.0."""
+    """None rel_gain_vs_prev_best values should be treated as 0.0."""
 
     def test_none_improvement_treated_as_zero(self) -> None:
         rounds = [
