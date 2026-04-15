@@ -1,0 +1,26 @@
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+service_tier = "fast"
+approvals_reviewer = "guardian_subagent"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[profiles.manager]
+model_instructions_file = "agents/manager.toml"
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+service_tier = "fast"
+approvals_reviewer = "guardian_subagent"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[[skills.config]]
+path = "/Users/joelchen/.codex/skills/.system/skill-installer/SKILL.md"
+enabled = false
+
+[features]
+prevent_idle_sleep = true
+guardian_approval = true
+
+[tui]
+status_line = ["model-with-reasoning", "model-name", "git-branch", "context-usage"]
