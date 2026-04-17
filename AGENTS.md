@@ -32,15 +32,26 @@ Build the simplest thing that closes the loop. Complexity is added only when a c
 - Don't split modules until a single module demonstrably cannot handle the scope
 - Prefer 50 lines of straightforward code over 20 lines of clever code
 
-### 3. Structured Data, Not Natural Language
+### 3. Evolve Existing Structure Before Adding New Surface Area
+
+When updating docs or code, first locate the owning section, module, or abstraction and improve it in place. Do not append loosely related material just because it is faster.
+
+- Prefer clarifying, extending, or reorganizing existing sections over adding parallel sections
+- Add a new section or module only when the current structure has no natural home for the change
+- Avoid duplicate explanations, overlapping ownership, and disconnected notes
+- Keep documentation professional, precise, and logically coherent from top to bottom
+
+Large rewrites require explicit human alignment before discarding the current structure. Explain what would be replaced, why incremental edits are insufficient, and what the new structure will make clearer.
+
+### 4. Structured Data, Not Natural Language
 
 Agents communicate through structured formats (JSON directives, typed dataclasses), not prose. Profiling metrics are numbers, not descriptions of numbers. Optimization directions are enum tags, not sentences.
 
-### 4. Deterministic Where Possible, LLM Where Necessary
+### 5. Deterministic Where Possible, LLM Where Necessary
 
 Gate checks, tabu filtering, threshold comparisons, trend computation — these are code, not LLM calls. LLM reasoning is reserved for genuinely ambiguous decisions: tradeoff analysis between conflicting bottlenecks, creative structural changes, cross-candidate semantic diff.
 
-### 5. Grounded in Facts
+### 6. Grounded in Facts
 
 Every claim about kernel behavior must be backed by measurement. "Should be faster" is not a valid statement — "measured 1.2ms → 0.9ms on A100, shape [4096, 4096], p50 over 100 runs" is.
 
