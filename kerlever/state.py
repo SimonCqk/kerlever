@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from kerlever.types import (
@@ -20,6 +21,8 @@ from kerlever.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_KERNEL_HASH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
 
 
 class StateManager:
@@ -103,6 +106,30 @@ class StateManager:
         """
         path = self._kernels_dir / f"{code_hash}.cu"
         path.write_text(source_code, encoding="utf-8")
+
+    def load_kernel(self, code_hash: str) -> str | None:
+        """Load a persisted kernel source by hash if available.
+
+        Args:
+            code_hash: Candidate hash whose source should be loaded.
+
+        Returns:
+            Kernel source text, or None when kernels/<hash>.cu does not
+            exist.
+
+        Implements: REQ-ORCH-010
+        """
+        if _KERNEL_HASH_PATTERN.fullmatch(code_hash) is None:
+            logger.warning(
+                "Rejecting unsafe kernel hash for source load: %r",
+                code_hash,
+            )
+            return None
+
+        path = self._kernels_dir / f"{code_hash}.cu"
+        if not path.exists():
+            return None
+        return path.read_text(encoding="utf-8")
 
     def append_decision(self, entry: dict[str, object]) -> None:
         """Append a decision log entry to decision_log.jsonl.

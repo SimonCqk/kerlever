@@ -240,14 +240,30 @@ def _build_recombination_prompt(
     """Build user prompt for EXPLORE/RECOMBINATION sub-mode."""
     parts: list[str] = []
 
-    # Include parent sources if available
-    if directive.parent_candidates and len(directive.parent_candidates) >= 2:
-        # Use current_best_source as context for parent retrieval
-        parts.append(f"Parent A (hash: {directive.parent_candidates[0]}):")
-        if current_best_source:
-            parts.append(f"```cuda\n{current_best_source}\n```")
-        parts.append(f"Parent B (hash: {directive.parent_candidates[1]}):")
-        parts.append("(Source code should be provided by the orchestrator)")
+    if directive.parent_candidates:
+        parent_sources = directive.parent_sources or {}
+        missing_sources: list[str] = []
+        parts.append("Requested parent candidates:")
+        parts.append(", ".join(directive.parent_candidates))
+
+        available_sections: list[str] = []
+        for parent_hash in directive.parent_candidates:
+            source = parent_sources.get(parent_hash)
+            if source is None:
+                missing_sources.append(parent_hash)
+                continue
+            available_sections.append(
+                f"Parent source (hash: {parent_hash}):\n```cuda\n{source}\n```"
+            )
+
+        if available_sections:
+            parts.append("Available parent sources:")
+            parts.extend(available_sections)
+        if missing_sources:
+            parts.append(
+                "Unavailable parent sources (do not fabricate or infer source "
+                f"bodies): {', '.join(missing_sources)}"
+            )
     elif current_best_source:
         parts.append(f"Parent source:\n```cuda\n{current_best_source}\n```")
 

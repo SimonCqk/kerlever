@@ -8,7 +8,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -359,14 +359,92 @@ class StrategyDirective(BaseModel):
     gene_map: dict[str, str] | None = None
     search_range: dict[str, list[float]] | None = None
     hard_constraints: list[str] | None = None
+    parent_sources: dict[str, str] | None = None
+
+
+class SemanticDelta(BaseModel):
+    """Evidence-linked semantic change observed for one candidate.
+
+    Implements: REQ-CCA-001, REQ-CCA-003
+    Invariant: INV-CCA-001 (claim carries candidate and evidence links)
+    """
+
+    candidate_hash: str
+    parent_hashes: list[str]
+    outcome: CandidateOutcome
+    summary: str
+    changed_features: list[str]
+    evidence_refs: list[str]
+    confidence: Literal["low", "medium", "high"]
+
+
+class CandidateGene(BaseModel):
+    """Reusable candidate trait supported by measured evidence.
+
+    Implements: REQ-CCA-001, REQ-CCA-005, REQ-CCA-006
+    Invariant: INV-CCA-003 (regressions are not positive gene sources)
+    """
+
+    gene_id: str
+    source_candidate_hash: str
+    gene_type: str
+    description: str
+    evidence: dict[str, float]
+    affected_shape_ids: list[str]
+    risk_flags: list[str] = Field(default_factory=list)
+    confidence: Literal["low", "medium", "high"]
+
+
+class RecombinationHint(BaseModel):
+    """Evidence-backed hint for combining complementary candidate genes.
+
+    Implements: REQ-CCA-001, REQ-CCA-007
+    Invariant: INV-CCA-003 (parents are non-regressing candidates)
+    """
+
+    hint_id: str
+    parent_candidates: list[str]
+    gene_map: dict[str, str]
+    expected_benefit: str
+    evidence_candidate_hashes: list[str]
+    required_constraints: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
+    confidence: Literal["low", "medium", "high"]
+
+
+class AvoidPattern(BaseModel):
+    """Local pattern to avoid based on measured regression evidence.
+
+    Implements: REQ-CCA-001, REQ-CCA-006
+    Invariant: INV-CCA-001 (avoidance is evidence-linked)
+    """
+
+    pattern_id: str
+    source_candidate_hash: str
+    pattern: str
+    reason: str
+    evidence: dict[str, float]
+    affected_shape_ids: list[str]
+    scope: str = "candidate_local"
+    confidence: Literal["low", "medium", "high"]
 
 
 class CrossCandidateAnalysis(BaseModel):
-    """Output from cross-candidate analysis."""
+    """Output from cross-candidate analysis.
+
+    Legacy fields remain required for existing callers. Rich structured
+    fields default to empty lists so old constructors and stubs remain valid.
+
+    Implements: REQ-CCA-001, REQ-CCA-008
+    """
 
     insights: list[str]
     winning_genes: list[str]
     recombination_suggestions: list[str]
+    semantic_deltas: list[SemanticDelta] = Field(default_factory=list)
+    candidate_genes: list[CandidateGene] = Field(default_factory=list)
+    recombination_hints: list[RecombinationHint] = Field(default_factory=list)
+    avoid_patterns: list[AvoidPattern] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

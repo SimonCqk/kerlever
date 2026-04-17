@@ -143,6 +143,35 @@ def assemble_llm_context(
 
     # 6. Cross-candidate analysis
     if cross_analysis is not None:
+        if cross_analysis.recombination_hints:
+            hint_lines = []
+            for hint in cross_analysis.recombination_hints[:2]:
+                hint_lines.append(
+                    "  "
+                    f"{hint.hint_id}: parents={hint.parent_candidates}, "
+                    f"gene_map={hint.gene_map}, "
+                    f"evidence={hint.evidence_candidate_hashes}, "
+                    f"confidence={hint.confidence}, "
+                    f"risks={hint.risk_flags}"
+                )
+            sections.append("Structured recombination hints:\n" + "\n".join(hint_lines))
+        if cross_analysis.avoid_patterns:
+            avoid_lines = []
+            for pattern in cross_analysis.avoid_patterns[:3]:
+                evidence_str = ", ".join(
+                    f"{key}={value:.4f}" for key, value in pattern.evidence.items()
+                )
+                avoid_lines.append(
+                    "  "
+                    f"{pattern.pattern} from {pattern.source_candidate_hash}: "
+                    f"evidence={{{evidence_str}}}, "
+                    f"shapes={pattern.affected_shape_ids}, "
+                    f"confidence={pattern.confidence}, scope={pattern.scope}"
+                )
+            sections.append(
+                "Structured avoid patterns (evidence context, not hard "
+                "constraints):\n" + "\n".join(avoid_lines)
+            )
         if cross_analysis.insights:
             sections.append(
                 f"Cross-candidate insights: {'; '.join(cross_analysis.insights[:3])}"

@@ -240,6 +240,39 @@ class TestBuildUserPromptRecombination:
         assert "hash_A" in prompt
         assert "hash_B" in prompt
 
+    def test_includes_available_parent_sources(self) -> None:
+        """RECOMBINATION prompt includes hydrated parent source bodies."""
+        spec = _make_problem_spec()
+        directive = _make_directive(mode=Mode.EXPLORE, sub_mode=SubMode.RECOMBINATION)
+        directive.parent_sources = {
+            "hash_A": "__global__ void parent_a() {}",
+            "hash_B": "__global__ void parent_b() {}",
+        }
+
+        prompt = build_user_prompt(
+            spec, directive, "// current incumbent", 0, SubMode.RECOMBINATION
+        )
+
+        assert "__global__ void parent_a" in prompt
+        assert "__global__ void parent_b" in prompt
+        assert "current incumbent" not in prompt
+        assert "Unavailable parent sources" not in prompt
+
+    def test_missing_parent_sources_are_explicitly_unavailable(self) -> None:
+        """RECOMBINATION prompt lists missing parents without placeholders."""
+        spec = _make_problem_spec()
+        directive = _make_directive(mode=Mode.EXPLORE, sub_mode=SubMode.RECOMBINATION)
+        directive.parent_sources = {"hash_A": "__global__ void parent_a() {}"}
+
+        prompt = build_user_prompt(
+            spec, directive, "// current incumbent", 0, SubMode.RECOMBINATION
+        )
+
+        assert "__global__ void parent_a" in prompt
+        assert "Unavailable parent sources" in prompt
+        assert "hash_B" in prompt
+        assert "Source code should be provided" not in prompt
+
 
 class TestBuildUserPromptPatternApply:
     """Tests for PATTERN_APPLY user prompt."""

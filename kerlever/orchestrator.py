@@ -39,6 +39,8 @@ from kerlever.types import (
     RoundSummary,
     ShapeBenchResult,
     StaticAnalysis,
+    StrategyDirective,
+    SubMode,
     TabuEntry,
 )
 
@@ -47,6 +49,15 @@ logger = logging.getLogger(__name__)
 # Outcomes that qualify for cross-candidate analysis input
 _PASSING_OUTCOMES = frozenset(
     {CandidateOutcome.IMPROVED, CandidateOutcome.BASELINE_MATCH}
+)
+
+# Outcomes that reached trustworthy benchmarking and qualify for analysis.
+_ANALYSIS_OUTCOMES = frozenset(
+    {
+        CandidateOutcome.IMPROVED,
+        CandidateOutcome.BASELINE_MATCH,
+        CandidateOutcome.REGRESSION,
+    }
 )
 
 # Number of rounds a tabu entry remains active after creation.
@@ -203,6 +214,7 @@ class Orchestrator:
                 prev_summary,
                 self._prev_cross_analysis,
             )
+            self._hydrate_parent_sources(directive)
 
             # --- Step 2: Request kernel candidates ---
             phase = Phase.AWAITING_CODING
@@ -226,6 +238,11 @@ class Orchestrator:
             passing_results = [
                 r for r in eval_results if r.outcome in _PASSING_OUTCOMES
             ]
+            analysis_results = [
+                r
+                for r in eval_results
+                if r.outcome in _ANALYSIS_OUTCOMES and r.benchmark is not None
+            ]
             improved_results = [
                 r for r in eval_results if r.outcome == CandidateOutcome.IMPROVED
             ]
@@ -239,13 +256,19 @@ class Orchestrator:
             # --- Step 8: Cross-candidate analysis (REQ-ORCH-007) ---
             phase = Phase.ANALYSIS
             cross_analysis: CrossCandidateAnalysis | None = None
-            if len(passing_results) >= 2:
-                # Build (candidate, result) pairs for passing candidates
+            if len(analysis_results) >= 2:
+                # Build pairs for candidates with benchmarked analysis evidence.
                 candidate_by_hash = {c.code_hash: c for c in candidates}
                 top_k = [
-                    (candidate_by_hash[r.candidate_hash], r) for r in passing_results
+                    (candidate_by_hash[r.candidate_hash], r)
+                    for r in analysis_results
+                    if r.candidate_hash in candidate_by_hash
                 ]
-                cross_analysis = await self._analyzer.analyze(top_k, self._problem_spec)
+                if len(top_k) >= 2:
+                    cross_analysis = await self._analyzer.analyze(
+                        top_k,
+                        self._problem_spec,
+                    )
             self._prev_cross_analysis = cross_analysis
 
             # --- Step 9: Record attempt history, tabu, bottleneck ---
@@ -351,6 +374,38 @@ class Orchestrator:
         self._state_mgr.save_result(result)
 
         return result
+
+    def _hydrate_parent_sources(self, directive: StrategyDirective) -> None:
+        """Populate available parent source bodies for recombination directives.
+
+        Source lookup checks the current incumbent first and then persisted
+        kernels/<hash>.cu files. Missing parents are left absent from the
+        mapping so the Coding Agent can degrade without fabricated source.
+
+        Implements: REQ-ORCH-010, SCN-ORCH-013-01
+        """
+        if (
+            directive.sub_mode != SubMode.RECOMBINATION
+            or not directive.parent_candidates
+        ):
+            return
+
+        sources: dict[str, str] = {}
+        for parent_hash in directive.parent_candidates:
+            if parent_hash == self._state.incumbent.kernel_hash:
+                sources[parent_hash] = self._state.incumbent.source_code
+                continue
+
+            persisted = self._state_mgr.load_kernel(parent_hash)
+            if persisted is None:
+                logger.info(
+                    "Parent source %s unavailable for recombination",
+                    parent_hash,
+                )
+                continue
+            sources[parent_hash] = persisted
+
+        directive.parent_sources = sources
 
     async def _evaluate_candidates_concurrently(
         self,

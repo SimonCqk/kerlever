@@ -217,6 +217,25 @@ def test_save_kernel(tmp_path: Path) -> None:
     assert kernel_file.read_text() == "__global__ void k() {}"
 
 
+def test_load_kernel_rejects_unsafe_hash_input(tmp_path: Path) -> None:
+    """load_kernel refuses path traversal and non-hash-like input."""
+    mgr = StateManager(tmp_path)
+    (tmp_path / "secret.cu").write_text("secret", encoding="utf-8")
+
+    assert mgr.load_kernel("../secret") is None
+    assert mgr.load_kernel("not a hash") is None
+    assert mgr.load_kernel(" hash_A") is None
+
+
+def test_load_kernel_accepts_simple_legacy_hash_like_values(tmp_path: Path) -> None:
+    """load_kernel keeps backward-compatible hash-like names."""
+    mgr = StateManager(tmp_path)
+    source = "__global__ void k() {}"
+    mgr.save_kernel("hash_A", source)
+
+    assert mgr.load_kernel("hash_A") == source
+
+
 def test_append_decision(tmp_path: Path) -> None:
     """Decision log entries are appended as JSONL."""
     mgr = StateManager(tmp_path)

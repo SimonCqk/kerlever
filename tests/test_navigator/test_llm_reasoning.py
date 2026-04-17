@@ -14,18 +14,22 @@ import pytest
 
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.navigator.llm_reasoning import (
+    assemble_llm_context,
     parse_llm_decision,
     run_llm_reasoning,
     validate_llm_decision,
 )
 from kerlever.navigator.types import DerivedSignals, LLMDecision
 from kerlever.types import (
+    AvoidPattern,
     BaselineArtifact,
+    CrossCandidateAnalysis,
     Mode,
     ObjectiveScore,
     OptimizationState,
     PerformanceObjective,
     ProblemSpec,
+    RecombinationHint,
     ShapeBenchResult,
     ShapeCase,
     StaticAnalysis,
@@ -399,3 +403,54 @@ class TestRunLLMReasoningDoubleFailure:
 
         with pytest.raises(RuntimeError, match="failed after 2"):
             await run_llm_reasoning(state, signals, None, client, config)
+
+
+class TestAssembleLLMContext:
+    """Cross-analysis context assembly."""
+
+    def test_includes_structured_hints_and_avoid_patterns(self) -> None:
+        """Structured cross-analysis fields appear in LLM context."""
+        cross_analysis = CrossCandidateAnalysis(
+            insights=["legacy insight"],
+            winning_genes=[],
+            recombination_suggestions=[],
+            recombination_hints=[
+                RecombinationHint(
+                    hint_id="hint_1",
+                    parent_candidates=["hash_A", "hash_B"],
+                    gene_map={
+                        "memory_access": "hash_A",
+                        "compute_loop": "hash_B",
+                    },
+                    expected_benefit="Combine measured strengths.",
+                    evidence_candidate_hashes=["hash_A", "hash_B"],
+                    risk_flags=["shape_specific"],
+                    confidence="medium",
+                )
+            ],
+            avoid_patterns=[
+                AvoidPattern(
+                    pattern_id="avoid_1",
+                    source_candidate_hash="hash_bad",
+                    pattern="extra_sync",
+                    reason="extra sync regressed",
+                    evidence={"relative_to_incumbent": 1.2},
+                    affected_shape_ids=["s1"],
+                    confidence="medium",
+                )
+            ],
+        )
+
+        context = assemble_llm_context(
+            _make_state(),
+            _make_signals(),
+            cross_analysis,
+            NavigatorConfig(),
+        )
+
+        assert "Structured recombination hints" in context
+        assert "hash_A" in context
+        assert "memory_access" in context
+        assert "Structured avoid patterns" in context
+        assert "extra_sync" in context
+        assert "relative_to_incumbent=1.2000" in context

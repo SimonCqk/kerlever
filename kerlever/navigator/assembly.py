@@ -8,12 +8,15 @@ Spec: docs/navigator/spec.md §6.5
 
 from __future__ import annotations
 
+import re
+
 from kerlever.navigator.config import NavigatorConfig
 from kerlever.navigator.types import GateResult, LLMDecision
 from kerlever.types import (
     CrossCandidateAnalysis,
     Mode,
     OptimizationState,
+    RecombinationHint,
     StrategyDirective,
     SubMode,
     TabuEntry,
@@ -104,9 +107,17 @@ def assemble_directive(
             gene_map = None
             search_range = None
         elif sub_mode == SubMode.RECOMBINATION:
-            # Recombination: populate parents and gene map from cross-analysis
-            parent_candidates = _derive_parent_candidates(state, cross_analysis)
-            gene_map = _derive_gene_map(cross_analysis)
+            # Recombination needs at least two real parents. If analysis does
+            # not provide them, degrade to a normal de novo explore directive
+            # instead of fabricating a one-parent recombination.
+            parent_candidates = _derive_parent_candidates(cross_analysis)
+            if len(parent_candidates) < 2:
+                sub_mode = SubMode.DE_NOVO
+                parent_candidates = None
+                gene_map = None
+                search_range = None
+            else:
+                gene_map = _derive_gene_map(cross_analysis, parent_candidates)
 
         # Hardware constraints apply to explore mode too
         hard_constraints = _derive_hard_constraints()
@@ -230,39 +241,91 @@ def _derive_hard_constraints() -> list[str]:
 
 
 def _derive_parent_candidates(
-    state: OptimizationState,
     cross_analysis: CrossCandidateAnalysis | None,
 ) -> list[str]:
     """Derive parent kernel hashes for recombination.
 
-    Sourced from cross-candidate analysis's winning_genes or from the
-    top-performing candidates in recent history. Returns at least two hashes.
+    Prefer structured cross-candidate recombination hints. Legacy
+    winning_genes remain a compatibility fallback.
+
+    Implements: REQ-NAV-010
     """
     parents: list[str] = []
 
-    # Try winning genes from cross-analysis first
-    if cross_analysis is not None and cross_analysis.winning_genes:
-        parents.extend(cross_analysis.winning_genes[:2])
+    hint = _first_valid_recombination_hint(cross_analysis)
+    if hint is not None:
+        parents.extend(_sanitize_parent_candidates(hint.parent_candidates))
+    elif cross_analysis is not None and cross_analysis.winning_genes:
+        # Legacy fallback: historical tests used winning_genes as hashes.
+        parents.extend(_sanitize_parent_candidates(cross_analysis.winning_genes))
 
-    # Supplement from incumbent if needed
-    incumbent_hash = state.incumbent.kernel_hash
-    if len(parents) < 2 and incumbent_hash not in parents:
-        parents.append(incumbent_hash)
+    return parents[:2] if len(parents) >= 2 else []
 
-    return parents if parents else []
+
+_HASH_LIKE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
+
+
+def _looks_like_candidate_hash(value: str) -> bool:
+    """Return whether a legacy value is plausibly a candidate hash.
+
+    Legacy cross-analysis used simple hash strings in ``winning_genes``.
+    Rich analyzer compatibility messages and descriptive legacy strings are
+    not safe recombination parents and must be ignored.
+    """
+    return _HASH_LIKE_PATTERN.fullmatch(value.strip()) is not None
+
+
+def _sanitize_parent_candidates(values: list[str]) -> list[str]:
+    """Keep unique hash-like parent candidates in source order."""
+    parents: list[str] = []
+    for value in values:
+        parent_hash = value.strip()
+        if not _looks_like_candidate_hash(parent_hash):
+            continue
+        if parent_hash not in parents:
+            parents.append(parent_hash)
+    return parents
 
 
 def _derive_gene_map(
     cross_analysis: CrossCandidateAnalysis | None,
+    parent_candidates: list[str],
 ) -> dict[str, str]:
     """Derive gene map for recombination from cross-candidate analysis.
 
     Maps code section names to parent hashes.
+
+    Implements: REQ-NAV-010
     """
     gene_map: dict[str, str] = {}
 
-    if cross_analysis is not None and cross_analysis.recombination_suggestions:
-        for i, suggestion in enumerate(cross_analysis.recombination_suggestions[:3]):
-            gene_map[f"section_{i}"] = suggestion
+    parent_set = set(parent_candidates)
+    hint = _first_valid_recombination_hint(cross_analysis)
+    if hint is not None:
+        return {
+            section: parent_hash
+            for section, parent_hash in hint.gene_map.items()
+            if section and parent_hash in parent_set
+        }
 
     return gene_map if gene_map else {}
+
+
+def _first_valid_recombination_hint(
+    cross_analysis: CrossCandidateAnalysis | None,
+) -> RecombinationHint | None:
+    """Return the first structured hint usable for recombination assembly."""
+    if cross_analysis is None:
+        return None
+
+    for hint in cross_analysis.recombination_hints:
+        parents = _sanitize_parent_candidates(hint.parent_candidates)
+        parent_set = set(parents)
+        if len(parent_set) < 2:
+            continue
+        if not hint.gene_map:
+            continue
+        if all(parent_hash in parent_set for parent_hash in hint.gene_map.values()):
+            return hint
+
+    return None

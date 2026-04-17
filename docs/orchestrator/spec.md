@@ -36,13 +36,13 @@ The Orchestrator must maintain a global best kernel (the "incumbent") across all
 Candidates that fail compilation or correctness checks must be discarded immediately. They must not participate in incumbent comparison, cross-candidate analysis, or any downstream processing. Their outcome must be recorded as COMPILE_FAIL or CORRECTNESS_FAIL respectively.
 
 **REQ-ORCH-005: Candidate Discard on Regression** [traces SC-4]
-Candidates whose benchmark results regress against the incumbent (as determined by `BenchmarkBundle.regressed_vs_incumbent`) must be discarded from the "improving" pool. Their outcome must be recorded as REGRESSION. They must not participate in cross-candidate analysis. The regression threshold is determined by the evaluation pipeline using the `PerformanceObjective.regression_guard_pct` — the Orchestrator acts on the `regressed_vs_incumbent` flag returned by the pipeline.
+Candidates whose benchmark results regress against the incumbent (as determined by `BenchmarkBundle.regressed_vs_incumbent`) must be discarded from the "improving" pool. Their outcome must be recorded as REGRESSION, and they must never participate in incumbent comparison. Because they are correctness-passing and benchmarked, they may participate in cross-candidate analysis only as negative evidence for avoid patterns. The regression threshold is determined by the evaluation pipeline using the `PerformanceObjective.regression_guard_pct` — the Orchestrator acts on the `regressed_vs_incumbent` flag returned by the pipeline.
 
 **REQ-ORCH-006: Concurrent Candidate Evaluation** [traces SC-1]
 Multiple kernel candidates produced in a single round must be evaluated concurrently using asyncio.TaskGroup. A failure in one candidate's evaluation must not abort or corrupt the evaluation of other candidates in the same round.
 
 **REQ-ORCH-007: Cross-Candidate Analysis Gate** [traces SC-1]
-Cross-candidate analysis must only be invoked when a round produces two or more candidates that passed evaluation (outcome is IMPROVED or BASELINE_MATCH). If fewer than two candidates pass, cross-candidate analysis is skipped for that round.
+Cross-candidate analysis must only be invoked when a round produces two or more correctness-passing candidates that reached benchmarking (outcome is IMPROVED, BASELINE_MATCH, or REGRESSION). IMPROVED and BASELINE_MATCH candidates provide positive or neutral comparison evidence; REGRESSION candidates provide negative evidence only. If fewer than two benchmarked candidates are available, cross-candidate analysis is skipped for that round.
 
 **REQ-ORCH-008: Problem Spec Loading** [traces SC-1]
 The Orchestrator must accept a ProblemSpec (loaded from YAML) that defines the optimization target: operation name, shape cases with weights and tolerances, dtype, target GPU, performance objective definition, target metric value, maximum rounds, and reference kernel source.
@@ -51,6 +51,9 @@ The Orchestrator must accept a ProblemSpec (loaded from YAML) that defines the o
 Before round 0, the system must seed OptimizationState with a measured baseline artifact produced by compiling, validating, benchmarking, and profiling the reference kernel on the target GPU. The baseline artifact becomes both the initial baseline and the initial incumbent. If baseline bootstrap fails (compile error, correctness failure), the optimization loop must not start.
 
 > **V2: implementation deferred until GPU Pipeline is ready.** Current behavior: construct BaselineArtifact from ProblemSpec declared values (shape_cases produce synthetic ShapeBenchResults, objective_score is computed from declared weights, profile_bundle is None). The bootstrap still populates `OptimizationState.baseline` and `OptimizationState.incumbent` so that all downstream logic referencing these fields works identically in V1 stubs and V2 real pipeline.
+
+**REQ-ORCH-010: Recombination Parent Source Hydration** [traces SC-9]
+When the Strategy Navigator returns an EXPLORE/RECOMBINATION directive with `parent_candidates`, the Orchestrator must resolve available parent source code before calling the Coding Agent and populate `StrategyDirective.parent_sources` with a mapping from parent hash to source body. Source lookup must check the current incumbent first and then persisted `kernels/<hash>.cu` files. Missing sources must not change the CodingAgentProtocol signature or block the round; unresolved hashes are simply absent from `parent_sources` and the Coding Agent degrades gracefully.
 
 ### Quality Gates
 
@@ -121,7 +124,7 @@ All source code must pass `ruff check` with no errors.
 - AND: candidate A's BenchmarkBundle has regressed_vs_incumbent = True
 - WHEN: evaluation completes
 - THEN: candidate A's outcome is REGRESSION
-- AND: candidate A is not included in cross-candidate analysis input
+- AND: candidate A may be included in cross-candidate analysis input only as negative evidence
 
 **SCN-ORCH-006-01: Concurrent evaluation isolates failures**
 - GIVEN: a round with 4 candidates
@@ -130,12 +133,20 @@ All source code must pass `ruff check` with no errors.
 - THEN: candidates 1, 3, and 4 still complete evaluation normally
 - AND: candidate 2 is recorded with outcome ERROR
 
-**SCN-ORCH-007-01: Cross-analysis skipped with fewer than 2 passing candidates**
+**SCN-ORCH-007-01: Cross-analysis skipped with fewer than 2 benchmarked candidates**
 - GIVEN: a round produces 3 candidates
 - AND: 2 fail compilation, 1 passes with IMPROVED outcome
 - WHEN: the round reaches the analysis phase
 - THEN: cross-candidate analysis is not invoked
 - AND: the round proceeds directly to state update
+
+**SCN-ORCH-007-02: Regression included as negative analysis evidence**
+- GIVEN: a round produces one IMPROVED candidate and one REGRESSION candidate
+- AND: both candidates passed correctness and have benchmark bundles
+- WHEN: the round reaches the analysis phase
+- THEN: cross-candidate analysis is invoked with both candidates
+- AND: the REGRESSION candidate is available only as negative evidence
+- AND: the REGRESSION candidate is not considered for incumbent update
 
 **SCN-ORCH-008-01: ProblemSpec loaded from YAML**
 - GIVEN: a YAML file with valid fields (op_name, shape_cases with weights, objective, target_metric_value, max_rounds, reference_kernel)
@@ -192,6 +203,20 @@ All source code must pass `ruff check` with no errors.
 - THEN: the RoundSummary for this round has abs_gain_vs_prev_best_us = 0.5
 - AND: rel_gain_vs_prev_best = 0.25 (i.e. (2.0 - 1.5) / 2.0)
 
+**SCN-ORCH-013-01: Recombination parent sources hydrated before generation**
+- GIVEN: the Strategy Navigator returns a RECOMBINATION directive with parent_candidates = ["hash_A", "hash_B"]
+- AND: `kernels/hash_A.cu` and `kernels/hash_B.cu` exist in the workdir
+- WHEN: the Orchestrator prepares to call the Coding Agent
+- THEN: `directive.parent_sources` maps "hash_A" and "hash_B" to their source code
+- AND: the CodingAgentProtocol signature is unchanged
+
+**SCN-ORCH-013-02: Missing parent source does not block the round**
+- GIVEN: the Strategy Navigator returns a RECOMBINATION directive with parent_candidates = ["hash_A", "hash_missing"]
+- AND: only `hash_A` can be resolved from incumbent or workdir storage
+- WHEN: the Orchestrator hydrates parent sources
+- THEN: `directive.parent_sources` contains only "hash_A"
+- AND: candidate generation is still attempted
+
 ---
 
 ## §4 Invariants
@@ -209,8 +234,8 @@ Every kernel candidate's source code is written to `kernels/<hash>.cu` before ev
 *Enforcement:* Kernel source files are written immediately after receiving candidates from the Coding Agent, before dispatching evaluation.
 
 **INV-ORCH-004: Failed candidates never reach analysis**
-Candidates with outcome COMPILE_FAIL, CORRECTNESS_FAIL, REGRESSION, or ERROR are filtered out before being passed to cross-candidate analysis.
-*Enforcement:* The cross-candidate analysis input is constructed by filtering evaluation results to only those with outcome IMPROVED or BASELINE_MATCH.
+Candidates with outcome COMPILE_FAIL, CORRECTNESS_FAIL, or ERROR are filtered out before being passed to cross-candidate analysis. Candidates with outcome REGRESSION may reach analysis only because they are correctness-passing and benchmarked; they remain ineligible for incumbent update.
+*Enforcement:* The cross-candidate analysis input is constructed by filtering evaluation results to outcomes IMPROVED, BASELINE_MATCH, or REGRESSION with a present BenchmarkBundle; the incumbent-update input remains filtered to IMPROVED only.
 
 **INV-ORCH-005: State file writes are atomic**
 State files (state.json, round files, result.json) must not be left in a partially written state after a crash.
@@ -252,7 +277,7 @@ Parameter semantics:
 - `cross_analysis`: Output from the previous round's cross-candidate analysis, or None on the first round.
 - `incumbent`: The current incumbent BaselineArtifact. The Coding Agent uses `incumbent.source_code` as the base for exploit-mode mutations. The GPU Pipeline uses both baseline and incumbent for regression detection and objective score computation.
 - `baseline`: The original measured (or V1 synthetic) BaselineArtifact. Used by the GPU Pipeline to compute `ObjectiveScore.relative_to_baseline`.
-- `top_k_results`: List of (candidate, evaluation_result) pairs for candidates that passed evaluation in the current round.
+- `top_k_results`: List of (candidate, evaluation_result) pairs for correctness-passing candidates that reached benchmarking in the current round. This includes IMPROVED and BASELINE_MATCH candidates as positive/neutral evidence and REGRESSION candidates as negative evidence; compile, correctness, and infrastructure failures are excluded.
 
 ### Shared Types
 
@@ -400,11 +425,55 @@ All types are Pydantic BaseModel (for serialization) or Python enums. These type
 - gene_map: dict[str, str] | None = None
 - search_range: dict[str, list[float]] | None = None
 - hard_constraints: list[str] | None = None
+- parent_sources: dict[str, str] | None = None — optional parent hash -> source mapping hydrated by Orchestrator for recombination before calling Coding Agent
+
+**SemanticDelta**:
+- candidate_hash: str
+- parent_hashes: list[str]
+- outcome: CandidateOutcome
+- summary: str
+- changed_features: list[str]
+- evidence_refs: list[str]
+- confidence: str
+
+**CandidateGene**:
+- gene_id: str
+- source_candidate_hash: str
+- gene_type: str
+- description: str
+- evidence: dict[str, float]
+- affected_shape_ids: list[str]
+- risk_flags: list[str] = []
+- confidence: str
+
+**RecombinationHint**:
+- hint_id: str
+- parent_candidates: list[str]
+- gene_map: dict[str, str]
+- expected_benefit: str
+- evidence_candidate_hashes: list[str]
+- required_constraints: list[str] = []
+- risk_flags: list[str] = []
+- confidence: str
+
+**AvoidPattern**:
+- pattern_id: str
+- source_candidate_hash: str
+- pattern: str
+- reason: str
+- evidence: dict[str, float]
+- affected_shape_ids: list[str]
+- scope: str = "candidate_local"
+- confidence: str
 
 **CrossCandidateAnalysis**:
 - insights: list[str]
 - winning_genes: list[str]
 - recombination_suggestions: list[str]
+- semantic_deltas: list[SemanticDelta] = []
+- candidate_genes: list[CandidateGene] = []
+- recombination_hints: list[RecombinationHint] = []
+- avoid_patterns: list[AvoidPattern] = []
 
 #### Round and State Types
 
@@ -527,20 +596,23 @@ The Orchestrator operates as a single async function that runs a bounded loop. E
 Bootstrap: construct BaselineArtifact, seed OptimizationState with baseline and incumbent
 For each round from 0 to max_rounds - 1:
     1. Request strategy directive from Strategy Navigator
-    2. Request kernel candidates from Coding Agent
-    3. Persist all candidate source files to workdir
-    4. Evaluate all candidates concurrently
-    5. Classify outcomes and filter results
-    6. Update incumbent if any candidate improved
-    7. Check termination: if target met, break
-    8. Run cross-candidate analysis (if >= 2 passing candidates)
-    9. Record attempt history, update tabu entries, update bottleneck history
-    10. Build round summary, persist round state, append to decision log
-    11. Increment round counter
+    2. Hydrate parent_sources for recombination directives when parent source files are available
+    3. Request kernel candidates from Coding Agent
+    4. Persist all candidate source files to workdir
+    5. Evaluate all candidates concurrently
+    6. Classify outcomes and filter results
+    7. Update incumbent if any candidate improved
+    8. Check termination: if target met, break
+    9. Run cross-candidate analysis (if >= 2 benchmarked candidates)
+    10. Record attempt history, update tabu entries, update bottleneck history
+    11. Build round summary, persist round state, append to decision log
+    12. Increment round counter
 Build and persist OptimizationResult
 ```
 
 **First round special case:** On round 0, there is no prior round_summary or cross_analysis. The Orchestrator passes None for both when calling the Strategy Navigator. The incumbent is the baseline artifact constructed during bootstrap.
+
+**Parent-source hydration:** If the returned directive has sub_mode RECOMBINATION and non-empty `parent_candidates`, the Orchestrator resolves source code before candidate generation. It first checks whether any requested hash equals the current incumbent hash, then checks `kernels/<hash>.cu` in the workdir. Resolved sources are stored in `directive.parent_sources`. Missing parent files are logged but do not alter the protocol call or abort the round.
 
 ### 6.2 State Machine
 
@@ -570,14 +642,14 @@ After concurrent evaluation completes, each candidate has an EvaluationResult wi
 |---------|---------|--------------------------|----------------------|
 | IMPROVED | Objective score better than incumbent | Yes | Yes |
 | BASELINE_MATCH | Objective score within tolerance of incumbent | No (not strictly better) | Yes |
-| REGRESSION | Regressed against incumbent per regression guard | No | No |
+| REGRESSION | Regressed against incumbent per regression guard | No | Yes, negative evidence only |
 | COMPILE_FAIL | Compilation failed | No | No |
 | CORRECTNESS_FAIL | Compiled but produced wrong results | No | No |
 | ERROR | Unexpected error during evaluation | No | No |
 
 **Incumbent-update rule:** Only candidates with outcome IMPROVED are eligible to become the new incumbent. Among multiple IMPROVED candidates in the same round, the one with the lowest `benchmark.objective_score.value` wins.
 
-**Cross-analysis input:** Candidates with outcome IMPROVED or BASELINE_MATCH form the input to cross-candidate analysis. If this set has fewer than 2 members, cross-analysis is skipped.
+**Cross-analysis input:** Candidates with outcome IMPROVED, BASELINE_MATCH, or REGRESSION and a present BenchmarkBundle form the input to cross-candidate analysis. REGRESSION candidates are included only as negative evidence for avoid patterns and must not become incumbents or default recombination parents. If this set has fewer than 2 members, cross-analysis is skipped.
 
 **Handling evaluation exceptions:** If a candidate's evaluation raises an unexpected exception (not a compile/correctness failure, but an infrastructure error), the Orchestrator catches it, records the candidate with outcome ERROR, and continues evaluating other candidates. The round proceeds normally with the remaining results.
 
@@ -659,10 +731,10 @@ After each round, the Orchestrator appends a structured entry to decision_log.js
 
 | When | What is written | File |
 |------|----------------|------|
-| After candidates received (step 3) | Each candidate's source code | `kernels/<hash>.cu` |
-| After round completes (step 10) | Full optimization state snapshot | `state.json` |
-| After round completes (step 10) | This round's complete state | `rounds/round_NNN.json` |
-| After round completes (step 10) | Decision log entry (append) | `decision_log.jsonl` |
+| After candidates received (loop step 4) | Each candidate's source code | `kernels/<hash>.cu` |
+| After round completes (loop step 11) | Full optimization state snapshot | `state.json` |
+| After round completes (loop step 11) | This round's complete state | `rounds/round_NNN.json` |
+| After round completes (loop step 11) | Decision log entry (append) | `decision_log.jsonl` |
 | After loop exits | Final result | `result.json` |
 
 All writes to state.json, round files, and result.json use the atomic write pattern: write to `<path>.tmp`, then `os.replace(<path>.tmp, <path>)`. The decision_log.jsonl is append-only (open in append mode, write line, flush).
@@ -718,7 +790,7 @@ This traces the data and decision flow for a complete optimization run, followin
 
 4. **Strategy request.** The Orchestrator sends the current optimization state, previous round summary (None if N=0), and previous cross-analysis (None if N=0) to the Strategy Navigator. The Navigator can access baseline, incumbent, attempt history, tabu entries, and bottleneck history from the state. It returns a StrategyDirective specifying mode, direction, and number of candidates.
 
-5. **Candidate generation.** The Orchestrator sends the ProblemSpec, the directive, and the current incumbent to the Coding Agent. The Coding Agent uses `incumbent.source_code` as the base for exploit-mode mutations. It returns a list of KernelCandidate objects, each with a unique code_hash, source code, parent_hashes, and structured intent.
+5. **Candidate generation.** If the directive requests RECOMBINATION, the Orchestrator first hydrates `directive.parent_sources` from the incumbent or persisted kernel files for every selected parent hash it can resolve. The Orchestrator then sends the ProblemSpec, the directive, and the current incumbent to the Coding Agent. The Coding Agent uses `incumbent.source_code` as the base for exploit-mode mutations and `directive.parent_sources` for recombination prompts when present. It returns a list of KernelCandidate objects, each with a unique code_hash, source code, parent_hashes, and structured intent.
 
 6. **Kernel persistence.** Each candidate's source code is written to `kernels/<hash>.cu` in the workdir. This happens before evaluation so that even if evaluation crashes, the source code is preserved.
 
@@ -730,7 +802,7 @@ This traces the data and decision flow for a complete optimization run, followin
 
 10. **Termination check.** If `incumbent.objective_score.value <= target_metric_value`, the loop sets status TARGET_MET and proceeds to persist the round state before exiting.
 
-11. **Cross-candidate analysis.** If two or more candidates have outcome IMPROVED or BASELINE_MATCH, they are sent to the Cross-Candidate Analyzer. If fewer than two pass, this step is skipped.
+11. **Cross-candidate analysis.** If two or more candidates have outcome IMPROVED, BASELINE_MATCH, or REGRESSION with benchmark data, they are sent to the Cross-Candidate Analyzer. Regressions are included only as negative evidence. If fewer than two benchmarked candidates are available, this step is skipped.
 
 12. **State update.** AttemptRecords are created for every candidate. TabuEntries are created for non-improving directions. BottleneckAssessment from the best profiled candidate is appended to bottleneck_history. A RoundSummary is constructed with both absolute and relative gains.
 
@@ -753,6 +825,7 @@ This traces the data and decision flow for a complete optimization run, followin
 | 5 | Stale tabu data | Not recording attempt records for non-improving candidates | Strategy Navigator re-suggests the same direction on the same parent repeatedly | Always record AttemptRecords for all candidates regardless of outcome (INV-ORCH-007) |
 | 6 | Optimizing against wrong baseline | Starting the loop without measuring the reference kernel | Strategy decisions are based on declared, not measured, performance | Run baseline bootstrap before round 0 (INV-ORCH-006); V1 uses synthetic but structurally identical baseline |
 | 7 | Unit-inconsistent strategy signals | Storing only absolute gain and using it for percentage-based thresholds | Plateau detection and near-target logic produce wrong decisions | Store both absolute and relative gains in RoundSummary; downstream uses relative form for thresholds |
+| 8 | Placeholder recombination parent | Passing only parent hashes to Coding Agent without resolving source bodies | The LLM invents or ignores a selected parent, producing fake recombination | Hydrate `StrategyDirective.parent_sources` before generation; missing sources are explicit and handled gracefully (REQ-ORCH-010) |
 
 ---
 
@@ -760,11 +833,12 @@ This traces the data and decision flow for a complete optimization run, followin
 
 | Success Criteria | Requirements | Scenarios |
 |-----------------|-------------|-----------|
-| SC-1: Loop runs to termination with stubs, no hang/crash | REQ-ORCH-001, REQ-ORCH-006, REQ-ORCH-007, REQ-ORCH-008 | SCN-ORCH-001-01, SCN-ORCH-001-02, SCN-ORCH-006-01, SCN-ORCH-007-01, SCN-ORCH-008-01, SCN-ORCH-011-01 |
+| SC-1: Loop runs to termination with stubs, no hang/crash | REQ-ORCH-001, REQ-ORCH-006, REQ-ORCH-007, REQ-ORCH-008 | SCN-ORCH-001-01, SCN-ORCH-001-02, SCN-ORCH-006-01, SCN-ORCH-007-01, SCN-ORCH-007-02, SCN-ORCH-008-01, SCN-ORCH-011-01 |
 | SC-2: Workdir produces complete artifacts | REQ-ORCH-002 | SCN-ORCH-002-01 |
 | SC-3: Incumbent updates correctly using objective score | REQ-ORCH-003 | SCN-ORCH-003-01, SCN-ORCH-003-02 |
-| SC-4: Failed/regressing candidates discarded | REQ-ORCH-004, REQ-ORCH-005 | SCN-ORCH-004-01, SCN-ORCH-004-02, SCN-ORCH-005-01 |
+| SC-4: Failed candidates discarded and regressions excluded from incumbent update | REQ-ORCH-004, REQ-ORCH-005 | SCN-ORCH-004-01, SCN-ORCH-004-02, SCN-ORCH-005-01, SCN-ORCH-007-02 |
 | SC-5: mypy --strict and ruff check pass | QG-ORCH-001, QG-ORCH-002 | (quality gate, verified by CI) |
 | SC-6: Baseline bootstrap seeds measured state before round 0 | REQ-ORCH-009 | SCN-ORCH-009-01, SCN-ORCH-009-02, SCN-ORCH-009-03 |
 | SC-7: Typed search memory with attempt records and tabu entries | REQ-ORCH-003, REQ-ORCH-009 | SCN-ORCH-010-01, SCN-ORCH-010-02 |
 | SC-8: Unit-consistent strategy signals (abs + rel gains) | REQ-ORCH-003 | SCN-ORCH-012-01 |
+| SC-9: Recombination directives carry hydrated parent source when available | REQ-ORCH-010 | SCN-ORCH-013-01, SCN-ORCH-013-02 |

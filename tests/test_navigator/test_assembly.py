@@ -16,6 +16,7 @@ from kerlever.types import (
     OptimizationState,
     PerformanceObjective,
     ProblemSpec,
+    RecombinationHint,
     ShapeBenchResult,
     ShapeCase,
     StaticAnalysis,
@@ -199,6 +200,128 @@ class TestExploreRecombinationDirective:
         assert directive.parent_candidates is not None
         assert len(directive.parent_candidates) >= 2
         assert directive.gene_map is not None
+
+    def test_legacy_fallback_preserves_hash_like_values(self) -> None:
+        """Legacy simple hash-like winning genes remain usable as parents."""
+        decision = LLMDecision(
+            mode=Mode.EXPLORE,
+            direction="recombine_top_kernels",
+            sub_mode=SubMode.RECOMBINATION,
+            reasoning="Combine winning traits",
+            confidence="high",
+        )
+        cross_analysis = CrossCandidateAnalysis(
+            insights=[],
+            winning_genes=["hash_A", "hash_B"],
+            recombination_suggestions=[],
+        )
+        state = _make_state()
+        config = NavigatorConfig()
+
+        directive = assemble_directive(decision, state, cross_analysis, config)
+
+        assert directive.parent_candidates == ["hash_A", "hash_B"]
+
+    def test_legacy_fallback_ignores_no_evidence_message(self) -> None:
+        """Legacy no-evidence messages are not treated as parent hashes."""
+        decision = LLMDecision(
+            mode=Mode.EXPLORE,
+            direction="recombine_top_kernels",
+            sub_mode=SubMode.RECOMBINATION,
+            reasoning="Combine winning traits",
+            confidence="high",
+        )
+        cross_analysis = CrossCandidateAnalysis(
+            insights=[],
+            winning_genes=["No evidence-backed reusable genes identified."],
+            recombination_suggestions=[],
+        )
+        state = _make_state()
+        config = NavigatorConfig()
+
+        directive = assemble_directive(decision, state, cross_analysis, config)
+
+        assert directive.sub_mode == SubMode.DE_NOVO
+        assert directive.parent_candidates is None
+        assert directive.gene_map is None
+
+    def test_structured_recombination_hint_is_preferred(self) -> None:
+        """Structured hints set parents and gene_map before legacy fallback."""
+        decision = LLMDecision(
+            mode=Mode.EXPLORE,
+            direction="recombine_top_kernels",
+            sub_mode=SubMode.RECOMBINATION,
+            reasoning="Combine structured genes",
+            confidence="high",
+        )
+        cross_analysis = CrossCandidateAnalysis(
+            insights=[],
+            winning_genes=["legacy_A", "legacy_B"],
+            recombination_suggestions=["legacy_section"],
+            recombination_hints=[
+                RecombinationHint(
+                    hint_id="hint_1",
+                    parent_candidates=["hash_A", "hash_B"],
+                    gene_map={
+                        "memory_access": "hash_A",
+                        "compute_loop": "hash_B",
+                    },
+                    expected_benefit="Evidence-backed complementary genes.",
+                    evidence_candidate_hashes=["hash_A", "hash_B"],
+                    confidence="medium",
+                )
+            ],
+        )
+        state = _make_state()
+        config = NavigatorConfig()
+
+        directive = assemble_directive(decision, state, cross_analysis, config)
+
+        assert directive.parent_candidates == ["hash_A", "hash_B"]
+        assert directive.gene_map == {
+            "memory_access": "hash_A",
+            "compute_loop": "hash_B",
+        }
+
+    def test_structured_hint_filters_invalid_parent_hashes(self) -> None:
+        """Structured recombination hints never pass unsafe parents onward."""
+        decision = LLMDecision(
+            mode=Mode.EXPLORE,
+            direction="recombine_top_kernels",
+            sub_mode=SubMode.RECOMBINATION,
+            reasoning="Combine structured genes",
+            confidence="high",
+        )
+        cross_analysis = CrossCandidateAnalysis(
+            insights=[],
+            winning_genes=["legacy_A", "legacy_B"],
+            recombination_suggestions=[],
+            recombination_hints=[
+                RecombinationHint(
+                    hint_id="hint_unsafe",
+                    parent_candidates=["hash_A", "../secret", "hash_B"],
+                    gene_map={
+                        "memory_access": "hash_A",
+                        "compute_loop": "hash_B",
+                    },
+                    expected_benefit="Evidence-backed complementary genes.",
+                    evidence_candidate_hashes=["hash_A", "hash_B"],
+                    confidence="medium",
+                )
+            ],
+        )
+        state = _make_state()
+        config = NavigatorConfig()
+
+        directive = assemble_directive(decision, state, cross_analysis, config)
+
+        assert directive.sub_mode == SubMode.RECOMBINATION
+        assert directive.parent_candidates == ["hash_A", "hash_B"]
+        assert "../secret" not in directive.parent_candidates
+        assert directive.gene_map == {
+            "memory_access": "hash_A",
+            "compute_loop": "hash_B",
+        }
 
 
 class TestTabuFilter:

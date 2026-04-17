@@ -53,8 +53,8 @@ When the directive specifies EXPLOIT mode with PARAM_SEARCH sub-mode, the Coding
 **REQ-CA-009: PATTERN_APPLY Application** [traces SC-3]
 When the directive specifies EXPLOIT mode with PATTERN_APPLY sub-mode, the Coding Agent must apply a specific optimization pattern from the playbook to the current best kernel. The pattern is identified by the directive's direction field.
 
-**REQ-CA-010: RECOMBINATION Merge** [traces SC-2]
-When the directive specifies EXPLORE mode with RECOMBINATION sub-mode, the Coding Agent must merge code sections from multiple parent candidates as specified by the directive's `gene_map`. The parent source code must be retrieved and included in the prompt.
+**REQ-CA-010: RECOMBINATION Merge** [traces SC-2, SC-10]
+When the directive specifies EXPLORE mode with RECOMBINATION sub-mode, the Coding Agent must merge code sections from multiple parent candidates as specified by the directive's `gene_map`. Parent source code must come from `directive.parent_sources` when present. The Coding Agent must not invent missing parent source bodies; if a requested parent source is absent, it must degrade gracefully by using available parent sources and explicitly noting the missing source in the prompt context.
 
 **REQ-CA-011: GPU Constraint Fallback for Unknown Hardware** [traces SC-4]
 When the target GPU specified in `ProblemSpec` is not present in the hardware constraint table, the Coding Agent must use conservative default values (48KB shared memory per block, 255 max registers per thread, 1024 max threads per block, no async copy, no TMA, no FP8). Generation must not fail due to an unrecognized GPU target.
@@ -133,11 +133,21 @@ All 142 existing tests must continue to pass after the Coding Agent module is ad
 **SCN-CA-002-05: RECOMBINATION merges parent candidates**
 - GIVEN: a directive with mode = EXPLORE, sub_mode = RECOMBINATION
 - AND: parent_candidates = ["hash_A", "hash_B"]
+- AND: parent_sources maps both hashes to CUDA source code
 - AND: gene_map = {"memory_access": "hash_A", "compute_loop": "hash_B"}
-- AND: current_best_source contains the source for retrieval context
 - WHEN: the Coding Agent generates candidates
-- THEN: the user prompt includes both parent sources and the gene_map instructions
+- THEN: the user prompt includes both parent source bodies and the gene_map instructions
 - AND: returned candidates have sub_mode = RECOMBINATION
+
+**SCN-CA-002-06: RECOMBINATION degrades gracefully when a parent source is missing**
+- GIVEN: a directive with mode = EXPLORE, sub_mode = RECOMBINATION
+- AND: parent_candidates = ["hash_A", "hash_missing"]
+- AND: parent_sources contains only "hash_A"
+- WHEN: the Coding Agent builds the recombination prompt
+- THEN: the prompt includes the source for "hash_A"
+- AND: the prompt explicitly states that "hash_missing" source is unavailable
+- AND: the prompt does not include placeholder or fabricated code for the missing parent
+- AND: generation still attempts to produce candidates from available context
 
 ### Playbook Scenarios
 
@@ -327,6 +337,10 @@ For any target GPU string (including unrecognized ones), the hardware constraint
 Every returned KernelCandidate must have its `intent` field set to a `CandidateIntent` whose `direction`, `mode`, and `sub_mode` match the directive. These fields are metadata for downstream consumption and must accurately reflect the generation strategy.
 *Enforcement:* The `CandidateIntent` is constructed from the directive's fields during candidate assembly, not inferred or computed. The assembly step is the single point where KernelCandidate objects are constructed.
 
+**INV-CA-007: Recombination prompts never fabricate parent source**
+When a recombination directive references a parent hash whose source is absent from `directive.parent_sources`, the Coding Agent must represent that source as unavailable rather than using placeholder code or inventing a body.
+*Enforcement:* Prompt construction iterates over `directive.parent_candidates`, includes source only for hashes present in `directive.parent_sources`, and records missing hashes in a separate unavailable list.
+
 ---
 
 ## §5 Interfaces
@@ -344,7 +358,7 @@ generate(
 ```
 
 - `problem_spec`: Defines the target operation (op_name, op_semantics, shape_cases, dtype), target hardware (target_gpu), performance objective, and the reference kernel. The Coding Agent reads target_gpu for hardware constraint lookup, op_semantics/dtype for prompt construction, and shape_cases (each a ShapeCase with shape_id, dims, weight, correctness_tolerance, and profile flag) for shape information in prompts.
-- `directive`: The strategy directive from the Navigator. The Coding Agent reads mode, direction, sub_mode, num_candidates, base_kernel_hash, tabu, search_range, parent_candidates, gene_map, and hard_constraints.
+- `directive`: The strategy directive from the Navigator and Orchestrator hydration step. The Coding Agent reads mode, direction, sub_mode, num_candidates, base_kernel_hash, tabu, search_range, parent_candidates, gene_map, hard_constraints, and optional parent_sources for recombination prompts. `parent_sources` is carried on the directive; it does not add a new `generate()` parameter.
 - `current_best_source`: The CUDA source code of the current best-performing kernel. Required for EXPLOIT sub-modes (LOCAL_REWRITE, PARAM_SEARCH, PATTERN_APPLY). None on the first round (DE_NOVO) or when no candidate has passed evaluation yet.
 
 ### LLM Client Protocol (dependency)
@@ -596,10 +610,11 @@ The system prompt has four sections, assembled in order:
 - Reference kernel (if available): `{problem_spec.reference_kernel}` as a behavioral reference (not to be copied)
 
 *EXPLORE / RECOMBINATION:*
-- Parent A source: source code for the first parent in `{directive.parent_candidates}`
-- Parent B source: source code for the second parent
-- Gene map: `{directive.gene_map}` — which code sections to take from which parent
-- Task: "Combine the specified code sections from the parent kernels into a single kernel."
+- Parent candidates: `{directive.parent_candidates}`
+- Available parent sources: full source code for each parent hash present in `{directive.parent_sources}`
+- Missing parent sources: parent hashes requested by `parent_candidates` but absent from `parent_sources`; these are explicitly listed as unavailable and must not be fabricated
+- Gene map: `{directive.gene_map}` — which semantic code sections to take from which parent
+- Task: "Combine the specified code sections from the available parent kernels into a single kernel. If a mapped parent source is unavailable, preserve the intent using available context and do not invent that parent's code."
 - Constraints: `{directive.hard_constraints}` if present
 
 **Candidate variation:**
@@ -704,6 +719,7 @@ The constructor stores these and initializes the playbook and hardware table (bo
    - Look up the GPU spec for `problem_spec.target_gpu` from the hardware table (§6.1).
    - Query the playbook for relevant techniques based on the directive's direction, mode, and problem_spec.op_name (§6.2).
    - If directive sub_mode is EXPLOIT/* and current_best_source is None, log a warning and fall back to DE_NOVO-style generation (generate from op_semantics instead of mutating existing code).
+   - If directive sub_mode is RECOMBINATION, collect available parent sources from `directive.parent_sources` and record any requested parent hashes that are missing.
 
 2. **Build system prompt:**
    - Construct the system prompt from the GPU spec and playbook results (§6.3). This prompt is shared across all candidates in this call.
@@ -727,6 +743,7 @@ The constructor stores these and initializes the playbook and hardware table (bo
 - Hardware table miss → conservative defaults (INV-CA-005).
 - Playbook miss → Layer 1 fallback (INV-CA-004).
 - Missing current_best_source on EXPLOIT → fall back to DE_NOVO-style prompt.
+- Missing parent source on RECOMBINATION → include only available source bodies, list missing hashes explicitly, and continue without fabricated placeholders (INV-CA-007).
 
 ---
 
@@ -768,6 +785,18 @@ This traces two representative paths through the Coding Agent to show how the ge
 
 5. **Collect results:** 2 valid candidates are returned. Each has parent_hashes = [] (DE_NOVO), intent = CandidateIntent(direction="initial_exploration", mode=EXPLORE, sub_mode=DE_NOVO, rationale=None). The Orchestrator receives 2 candidates instead of the requested 3, but this is a valid outcome — the system continues with what was produced.
 
+### Path C: EXPLORE / RECOMBINATION — Structured Parent Sources
+
+**Trigger:** The Orchestrator calls `generate()` with an EXPLORE/RECOMBINATION directive produced from structured cross-candidate analysis. The directive has parent_candidates = ["hash_A", "hash_B"], gene_map = {"memory_access": "hash_A", "compute_loop": "hash_B"}, and parent_sources hydrated for both hashes.
+
+1. **Resolve context:** The Coding Agent reads the parent candidate hashes, verifies that `parent_sources` contains source bodies for both, and queries the playbook using the recombination direction and target operation.
+
+2. **Build prompt:** The recombination user prompt includes the source for hash_A, the source for hash_B, the structured gene_map, and any hard constraints. The prompt asks the LLM to combine mapped semantic sections from available parents.
+
+3. **Handle missing sources if needed:** If hash_B were absent from `parent_sources`, the prompt would list hash_B as unavailable and would not include placeholder code. Generation would continue with hash_A and the gene_map caveat.
+
+4. **Generate and validate:** Candidate generation follows the normal parse, validation, retry, and assembly flow. Returned candidates have parent_hashes set from `directive.parent_candidates`, preserving lineage even if some source bodies were unavailable during prompt construction.
+
 ---
 
 ## §8 Shortcut Risks
@@ -782,6 +811,7 @@ This traces two representative paths through the Coding Agent to show how the ge
 | 6 | Missing current_best_source on EXPLOIT silently generates nonsense | EXPLOIT sub-mode prompt expects current_best_source but receives None; the prompt has a placeholder gap | The LLM generates code without context, producing random kernels labeled as "mutations" of nothing | When current_best_source is None during an EXPLOIT sub-mode, the Coding Agent falls back to DE_NOVO-style generation with a logged warning (§6.6 step 1). |
 | 7 | GPU constraint table missing target GPU produces wrong features in prompt | Unknown GPU name falls through without a default, causing a KeyError or including no constraint info in the prompt | Generated code uses features the GPU does not support (e.g., TMA on V100), leading to compile failures | The hardware table returns conservative defaults for unknown GPUs (INV-CA-005). Conservative defaults disable all advanced features, so generated code only uses universally supported constructs. |
 | 8 | Retry prompt without error context fails the same way | Retrying by simply re-sending the same prompt (no feedback about what went wrong) | The LLM makes the same mistake twice, wasting the retry opportunity | The retry prompt appends the specific validation errors from the first attempt (§6.5 Step 4). The error context guides the LLM to fix the specific issue. |
+| 9 | Fake recombination parent | Prompt builder inserts placeholder code or asks the LLM to infer a missing parent source | The returned kernel is not a real recombination of measured parents and lineage becomes misleading | Use `directive.parent_sources` only; list missing parent hashes explicitly and never fabricate source (INV-CA-007). |
 
 ---
 
@@ -790,7 +820,7 @@ This traces two representative paths through the Coding Agent to show how the ge
 | Success Criteria | Requirements | Scenarios |
 |-----------------|-------------|-----------|
 | SC-1: DE_NOVO generates N kernels each with `__global__` function | REQ-CA-001 | SCN-CA-001-01, SCN-CA-001-02 |
-| SC-2: EXPLOIT/LOCAL_REWRITE mutates current_best | REQ-CA-002, REQ-CA-008, REQ-CA-010 | SCN-CA-002-01, SCN-CA-002-02, SCN-CA-002-03, SCN-CA-002-05 |
+| SC-2: EXPLOIT/LOCAL_REWRITE mutates current_best and RECOMBINATION uses parent sources | REQ-CA-002, REQ-CA-008, REQ-CA-010 | SCN-CA-002-01, SCN-CA-002-02, SCN-CA-002-03, SCN-CA-002-05, SCN-CA-002-06 |
 | SC-3: Playbook returns relevant techniques for direction | REQ-CA-003, REQ-CA-009 | SCN-CA-003-01, SCN-CA-003-02, SCN-CA-003-03, SCN-CA-003-04, SCN-CA-002-04 |
 | SC-4: GPU constraint table correct for A100/H100 | REQ-CA-004, REQ-CA-011 | SCN-CA-004-01, SCN-CA-004-02, SCN-CA-004-03 |
 | SC-5: Code validator catches missing `__global__`, unbalanced brackets | REQ-CA-005 | SCN-CA-005-01, SCN-CA-005-02, SCN-CA-005-03, SCN-CA-005-04, SCN-CA-005-05, SCN-CA-005-06, SCN-CA-005-07, SCN-CA-005-08 |
@@ -798,3 +828,4 @@ This traces two representative paths through the Coding Agent to show how the ge
 | SC-7: Each KernelCandidate has unique hash, correct intent (CandidateIntent), parent lineage (parent_hashes) | REQ-CA-007 | SCN-CA-007-01, SCN-CA-007-02, SCN-CA-007-03 |
 | SC-8: Existing 142 tests pass | QG-CA-003 | (verified by running existing test suite after module addition) |
 | SC-9: mypy --strict and ruff check pass | QG-CA-001, QG-CA-002 | (verified by CI tooling) |
+| SC-10: Recombination prompts receive hydrated parent sources and degrade gracefully when missing | REQ-CA-010 | SCN-CA-002-05, SCN-CA-002-06 |

@@ -22,8 +22,11 @@ from kerlever.types import (
     BenchmarkBundle,
     CandidateOutcome,
     CompileStatus,
+    CorrectnessResult,
+    CrossCandidateAnalysis,
     EvaluationResult,
     KernelCandidate,
+    Mode,
     ObjectiveScore,
     OptimizationState,
     PerformanceObjective,
@@ -31,6 +34,8 @@ from kerlever.types import (
     ShapeBenchResult,
     ShapeCase,
     StaticAnalysis,
+    StrategyDirective,
+    SubMode,
 )
 
 
@@ -162,10 +167,10 @@ async def test_compile_fail_discarded(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_regression_not_in_analysis(tmp_path: Path) -> None:
-    """Regression candidates don't enter cross-candidate analysis.
+async def test_regression_enters_analysis_as_negative_evidence(tmp_path: Path) -> None:
+    """Benchmarked regressions enter analysis but never update incumbent.
 
-    Implements: SCN-ORCH-005-01, REQ-ORCH-005, INV-ORCH-004
+    Implements: SCN-ORCH-007-02, REQ-ORCH-007
     """
 
     class AlwaysRegressPipeline:
@@ -182,6 +187,7 @@ async def test_regression_not_in_analysis(tmp_path: Path) -> None:
                 candidate_hash=candidate.code_hash,
                 compile_status=CompileStatus.SUCCESS,
                 static_analysis=StaticAnalysis(),
+                correctness=CorrectnessResult(passed=True),
                 benchmark=BenchmarkBundle(
                     shape_results=[
                         ShapeBenchResult(
@@ -207,15 +213,15 @@ async def test_regression_not_in_analysis(tmp_path: Path) -> None:
 
         def __init__(self) -> None:
             self.called = False
+            self.seen_outcomes: list[CandidateOutcome] = []
 
         async def analyze(
             self,
             top_k_results: list[tuple[KernelCandidate, EvaluationResult]],
             problem_spec: ProblemSpec,
-        ) -> object:
+        ) -> CrossCandidateAnalysis:
             self.called = True
-            from kerlever.types import CrossCandidateAnalysis
-
+            self.seen_outcomes = [result.outcome for _, result in top_k_results]
             return CrossCandidateAnalysis(
                 insights=[], winning_genes=[], recombination_suggestions=[]
             )
@@ -227,14 +233,18 @@ async def test_regression_not_in_analysis(tmp_path: Path) -> None:
         strategy_navigator=StubStrategyNavigator(),
         coding_agent=StubCodingAgent(),
         gpu_pipeline=AlwaysRegressPipeline(),
-        cross_analyzer=analyzer,  # type: ignore[arg-type]
+        cross_analyzer=analyzer,
         workdir=tmp_path,
     )
 
     await orch.run()
 
-    # Analyzer should never be called since no IMPROVED/BASELINE_MATCH
-    assert not analyzer.called
+    assert analyzer.called
+    assert analyzer.seen_outcomes
+    assert set(analyzer.seen_outcomes) == {CandidateOutcome.REGRESSION}
+
+    state = OptimizationState.model_validate_json((tmp_path / "state.json").read_text())
+    assert state.incumbent.kernel_hash == state.baseline.kernel_hash
 
 
 @pytest.mark.asyncio
@@ -436,10 +446,8 @@ async def test_cross_analysis_skipped_with_fewer_than_2(
             self,
             top_k_results: list[tuple[KernelCandidate, EvaluationResult]],
             problem_spec: ProblemSpec,
-        ) -> object:
+        ) -> CrossCandidateAnalysis:
             self.call_count += 1
-            from kerlever.types import CrossCandidateAnalysis
-
             return CrossCandidateAnalysis(
                 insights=[], winning_genes=[], recombination_suggestions=[]
             )
@@ -451,7 +459,7 @@ async def test_cross_analysis_skipped_with_fewer_than_2(
         strategy_navigator=StubStrategyNavigator(),
         coding_agent=StubCodingAgent(),
         gpu_pipeline=OnlyOnePassPipeline(),
-        cross_analyzer=analyzer,  # type: ignore[arg-type]
+        cross_analyzer=analyzer,
         workdir=tmp_path,
     )
 
@@ -554,6 +562,78 @@ async def test_kernels_persisted_before_evaluation(tmp_path: Path) -> None:
     # All kernel files should have non-empty content
     for kf in kernel_files:
         assert kf.stat().st_size > 0
+
+
+@pytest.mark.asyncio
+async def test_recombination_parent_sources_are_hydrated(tmp_path: Path) -> None:
+    """Orchestrator hydrates available parent sources before Coding Agent.
+
+    Implements: SCN-ORCH-013-01, SCN-ORCH-013-02
+    """
+
+    class RecombinationNavigator:
+        """Navigator that requests recombination with available and missing parents."""
+
+        async def decide(
+            self,
+            problem_spec: ProblemSpec,
+            optimization_state: OptimizationState,
+            round_summary: object,
+            cross_analysis: CrossCandidateAnalysis | None,
+        ) -> StrategyDirective:
+            return StrategyDirective(
+                mode=Mode.EXPLORE,
+                direction="recombine",
+                reason="test",
+                num_candidates=0,
+                tabu=[],
+                sub_mode=SubMode.RECOMBINATION,
+                parent_candidates=[
+                    optimization_state.incumbent.kernel_hash,
+                    "persisted_hash",
+                    "missing_hash",
+                ],
+                gene_map={
+                    "memory_access": optimization_state.incumbent.kernel_hash,
+                    "compute_loop": "persisted_hash",
+                },
+            )
+
+    class RecordingCodingAgent:
+        """Coding Agent that records the hydrated directive."""
+
+        def __init__(self) -> None:
+            self.directive: StrategyDirective | None = None
+
+        async def generate(
+            self,
+            problem_spec: ProblemSpec,
+            directive: StrategyDirective,
+            incumbent: BaselineArtifact,
+        ) -> list[KernelCandidate]:
+            self.directive = directive
+            return []
+
+    spec = _make_spec(max_rounds=1, target_metric_value=0.001)
+    coder = RecordingCodingAgent()
+    orch = Orchestrator(
+        problem_spec=spec,
+        strategy_navigator=RecombinationNavigator(),
+        coding_agent=coder,
+        gpu_pipeline=StubGPUPipeline(),
+        cross_analyzer=StubCrossCandidateAnalyzer(),
+        workdir=tmp_path,
+    )
+    persisted_source = "__global__ void persisted() {}"
+    (tmp_path / "kernels" / "persisted_hash.cu").write_text(persisted_source)
+
+    await orch.run()
+
+    assert coder.directive is not None
+    assert coder.directive.parent_sources is not None
+    assert coder.directive.parent_sources["persisted_hash"] == persisted_source
+    assert "missing_hash" not in coder.directive.parent_sources
+    assert spec.reference_kernel in coder.directive.parent_sources.values()
 
 
 @pytest.mark.asyncio

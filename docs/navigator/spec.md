@@ -51,6 +51,9 @@ Every directive returned by the Navigator must populate all fields of the extend
 **REQ-NAV-009: Backward-Compatible StrategyDirective Extension** [traces SC-9]
 The extended StrategyDirective fields (sub_mode, parent_candidates, gene_map, search_range, hard_constraints) must all be Optional with None defaults. Existing Orchestrator code that consumes StrategyDirective must continue to function without modification.
 
+**REQ-NAV-010: Structured Cross-Analysis Consumption** [traces SC-11]
+When `CrossCandidateAnalysis` contains structured `recombination_hints`, the Navigator must prefer those hints over legacy `winning_genes` and `recombination_suggestions` when assembling EXPLORE/RECOMBINATION directives. It must include structured `avoid_patterns` in LLM reasoning context and fall back to legacy fields only when structured hints are absent or invalid. The Navigator selects parent hashes and `gene_map`; it does not hydrate `parent_sources`.
+
 ### Quality Gates
 
 **QG-NAV-001: Type Safety** [traces SC-10]
@@ -223,6 +226,29 @@ All source code must pass `ruff check` with no errors.
 - THEN: parent_candidates contains at least two kernel hashes
 - AND: gene_map describes which code sections to take from which parent
 
+**SCN-NAV-008-08: Structured recombination hint is preferred**
+- GIVEN: cross_analysis contains `recombination_hints[0]` with parent_candidates = ["hash_A", "hash_B"]
+- AND: the hint has gene_map = {"memory_access": "hash_A", "compute_loop": "hash_B"}
+- AND: Navigator chooses EXPLORE/RECOMBINATION
+- WHEN: the directive is assembled
+- THEN: directive.parent_candidates is ["hash_A", "hash_B"]
+- AND: directive.gene_map is copied from the structured hint
+- AND: legacy `winning_genes` and `recombination_suggestions` are not used to override the structured hint
+
+**SCN-NAV-008-09: Legacy recombination fallback remains available**
+- GIVEN: cross_analysis has no valid structured `recombination_hints`
+- AND: legacy `winning_genes` and `recombination_suggestions` are present
+- AND: Navigator chooses EXPLORE/RECOMBINATION
+- WHEN: the directive is assembled
+- THEN: parent_candidates and gene_map are derived from the legacy fields or recent top-performing candidates
+- AND: the directive remains backward-compatible
+
+**SCN-NAV-008-10: Avoid patterns included in LLM context**
+- GIVEN: cross_analysis contains structured `avoid_patterns`
+- WHEN: Phase 3 constructs the LLM user prompt
+- THEN: the prompt includes the avoid pattern tags, affected candidate hashes, measured evidence, confidence, and risk flags
+- AND: avoid patterns are presented as evidence context, not as unconditional hard constraints
+
 ---
 
 ## §4 Invariants
@@ -251,6 +277,10 @@ Tabu filtering does not block a direction globally. It blocks the specific combi
 The Navigator must never return a directive with an unset mode or an empty reason string. The reason must explain the decision path taken (gate name, LLM reasoning summary, or UCB1 fallback).
 *Enforcement:* The directive assembly function validates that mode is set and reason is non-empty before returning. This is the single exit path for all directives.
 
+**INV-NAV-007: Structured cross-analysis takes precedence over legacy strings**
+When structured recombination hints are present and valid, legacy `winning_genes` and `recombination_suggestions` must not override parent selection or gene mapping. Legacy fields are compatibility fallback only.
+*Enforcement:* Recombination assembly checks `cross_analysis.recombination_hints` first, validates hashes and gene_map, and returns those fields before attempting legacy extraction.
+
 ---
 
 ## §5 Interfaces
@@ -271,7 +301,7 @@ decide(
 - `problem_spec`: Defines the target operation, hardware, shape cases, performance objective, and target metric value. The Navigator reads `target_metric_value` and the `objective` for near-target gate computation.
 - `optimization_state`: Full accumulated state — rounds history, typed attempt records, typed tabu entries, bottleneck assessments with evidence, baseline artifact, incumbent artifact, and current round counter. This is the Navigator's primary input for signal computation.
 - `round_summary`: Compressed summary of the most recent round. None on the first round. Used for quick access to the latest round's mode, direction, relative gain, and objective score.
-- `cross_analysis`: Output from cross-candidate analysis of the previous round. None on the first round or when analysis was skipped. Used by LLM reasoning context and for populating recombination fields.
+- `cross_analysis`: Output from cross-candidate analysis of the previous round. None on the first round or when analysis was skipped. Used by LLM reasoning context and for populating recombination fields. Structured `recombination_hints` and `avoid_patterns` are preferred when present; legacy strings are fallback context.
 
 ### LLM Client Protocol (dependency)
 
@@ -299,6 +329,7 @@ StrategyDirective:
     gene_map: dict[str, str] | None = None        # code section mapping for recombination
     search_range: dict[str, list[float]] | None = None  # parameter bounds for param search
     hard_constraints: list[str] | None = None     # constraints for Coding Agent to respect
+    parent_sources: dict[str, str] | None = None  # Orchestrator-hydrated source bodies; Navigator leaves None
 ```
 
 All new fields default to None, preserving backward compatibility with existing Orchestrator code.
@@ -456,7 +487,7 @@ The user prompt is assembled from the optimization state, capped at `llm_context
 3. Top-3 candidates by objective score with their performance numbers
 4. Last round's mode, direction, and `rel_gain_vs_prev_best`
 5. List of exhausted directions
-6. Cross-candidate analysis insights and recombination suggestions (if available)
+6. Cross-candidate analysis structured recombination hints and avoid patterns (if available), followed by legacy insights/recombination suggestions as fallback context
 7. Search tree summary (direction history with visit counts, computed from attempt records)
 
 Items are included in the above priority order. If the budget is exceeded, lower-priority items are truncated or omitted.
@@ -568,10 +599,11 @@ For EXPLORE DE_NOVO mode:
 - `hard_constraints`: Same as EXPLOIT (hardware limits still apply)
 
 For EXPLORE RECOMBINATION mode:
-- `parent_candidates`: List of kernel hashes to recombine. Sourced from cross-candidate analysis's winning_genes or from the top-performing candidates in recent history.
-- `gene_map`: Maps code section names to parent hashes, indicating which sections to take from which parent. Sourced from cross-candidate analysis's recombination_suggestions.
+- `parent_candidates`: List of kernel hashes to recombine. Prefer the first valid structured `cross_analysis.recombination_hints` entry; fall back to legacy `winning_genes` / `recombination_suggestions` or top-performing recent candidates only when structured hints are absent.
+- `gene_map`: Maps semantic code section names to parent hashes, indicating which sections to take from which parent. Prefer the structured hint's `gene_map`; legacy suggestions are fallback only.
 - `search_range`: None
 - `hard_constraints`: Same as EXPLOIT
+- `parent_sources`: Leave as None. Orchestrator hydrates this field from persisted kernel source files after the directive is returned.
 
 **Step 6: Assemble tabu entries for output**
 - The `tabu` field on the output StrategyDirective contains the active `TabuEntry` records from the optimization state — those where `expires_after_round >= current_round`. Expired entries are excluded.
@@ -644,6 +676,8 @@ Trigger: Rounds 1-3 were all EXPLOIT mode with small relative gains (avg_delta <
 4. Phase 4: mode=EXPLORE, direction="structural_change", num_candidates=3.
 5. The system breaks out of the local optimum with a structural change.
 
+**Structured recombination context:** If the previous cross-candidate analysis contains a high-confidence `RecombinationHint`, Phase 3 LLM context includes the hint's parent candidates, gene_map, evidence, and risk flags. If the selected decision is EXPLORE/RECOMBINATION, Phase 4 copies the structured parent hashes and gene_map into the directive and leaves `parent_sources` unset for Orchestrator hydration.
+
 **Round 7 — Exhausted Direction**
 
 Trigger: Rounds 5-7 all had the same stable bottleneck primary_tag "low_occupancy_regs" and the direction "reduce_register_pressure" appears 3 times in the attempt records.
@@ -686,6 +720,7 @@ Trigger: Incumbent's objective score has reached within 95% of the target metric
 | 6 | Exhausted direction silently re-selected by LLM | Not validating the LLM's chosen direction against the exhausted set | The system wastes rounds re-trying a direction that has already proven ineffective | LLM validation checks direction against the exhausted set (validation rule 5 in §6.3). Exhausted directions are also excluded from UCB1 candidates. |
 | 7 | StrategyDirective extension breaks Orchestrator | Adding required (non-Optional) fields to StrategyDirective | Existing Orchestrator code and stubs that construct StrategyDirective without the new fields fail at runtime | All new fields are Optional with None defaults (REQ-NAV-009). Existing code continues to work unchanged. |
 | 8 | Stale bottleneck history producing false stable_bottleneck | Not handling rounds with empty bottleneck tags (all candidates failed) | A round with no profiling data is treated as continuing the previous bottleneck streak | Rounds with empty bottleneck tag lists break the stability streak. stable_bottleneck requires K consecutive non-empty rounds with the same tag. |
+| 9 | Structured recombination ignored | Continuing to parse only legacy strings after structured hints are available | Navigator drops precise parent hashes and gene maps, causing weak or fake recombination | Prefer validated `recombination_hints` and use legacy fields only as fallback (REQ-NAV-010, INV-NAV-007). |
 
 ---
 
@@ -700,6 +735,7 @@ Trigger: Incumbent's objective score has reached within 95% of the target metric
 | SC-5: Exhausted direction forces EXPLORE | REQ-NAV-005 | SCN-NAV-005-01, SCN-NAV-005-02 |
 | SC-6: LLM failure degrades to retry then UCB1 | REQ-NAV-006 | SCN-NAV-006-01, SCN-NAV-006-02, SCN-NAV-006-03, SCN-NAV-006-04, SCN-NAV-006-05 |
 | SC-7: UCB1 selects least-explored direction | REQ-NAV-007 | SCN-NAV-007-01, SCN-NAV-007-02, SCN-NAV-007-03 |
-| SC-8: StrategyDirective has complete fields | REQ-NAV-008 | SCN-NAV-008-01, SCN-NAV-008-02, SCN-NAV-008-03, SCN-NAV-008-04, SCN-NAV-008-05, SCN-NAV-008-06, SCN-NAV-008-07 |
+| SC-8: StrategyDirective has complete fields | REQ-NAV-008 | SCN-NAV-008-01, SCN-NAV-008-02, SCN-NAV-008-03, SCN-NAV-008-04, SCN-NAV-008-05, SCN-NAV-008-06, SCN-NAV-008-07, SCN-NAV-008-08, SCN-NAV-008-09 |
 | SC-9: Orchestrator tests pass after extension | REQ-NAV-009 | (verified by running existing test suite after StrategyDirective extension) |
 | SC-10: mypy --strict and ruff check pass | QG-NAV-001, QG-NAV-002 | (verified by CI tooling) |
+| SC-11: Structured cross-analysis hints and avoid patterns influence Navigator context/directive assembly | REQ-NAV-010 | SCN-NAV-008-08, SCN-NAV-008-09, SCN-NAV-008-10 |
