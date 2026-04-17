@@ -50,7 +50,7 @@ correctness must never be timed for optimization scoring.
 | Measurement quality | Detect noise, drift, throttling, competing work, unstable samples, and invalid timing episodes |
 | Objective scoring | Aggregate per-shape measurements into the `PerformanceObjective` score |
 | Regression guard | Compare candidate score against the incumbent under a unit-consistent threshold |
-| Candidate ranking | Select top-K benchmark survivors for deep profiling |
+| Candidate ranking | Select score winners and diagnostic candidates for deep profiling |
 | Deep profiling | Collect raw Nsight Compute / Nsight Systems metrics for selected candidates and profile shapes |
 | Evidence preservation | Return raw measurements, normalized metrics, run identity, and artifact references without flattening them into prose |
 
@@ -205,6 +205,8 @@ The measurement envelope must include every variable that can change runtime:
 | `launch_spec_hash` | Block size, dynamic smem, and ABI change performance |
 | `module_artifact_hash` | Cubin/fatbin identity determines the executable device code |
 | `artifact_execution_model` | Interleaving validity depends on common-harness versus separate-process execution |
+| `metric_mode` | CUDA event, host launch, end-to-end, and CUDA graph replay timings answer different questions |
+| `function_attribute_policy` | Dynamic shared-memory limit, cache config, shared-memory/L1 carveout, and cluster attributes change launch/runtime behavior |
 | `objective_hash` | Shape weights and primary metric define ranking semantics |
 | `clock_policy` / observed clocks | GPU boost, locked clocks, and throttling can dominate microbenchmarks |
 | `cache_policy` | Warm-cache and cold-cache timings answer different questions |
@@ -260,18 +262,24 @@ hygiene condition is present:
 
 ### Clock Policy
 
-Preferred policy:
+Default policy is **observe and enforce hygiene**, because managed cloud GPU
+environments often do not permit clock locking. Locked clocks are a deployment
+hardening option, not the baseline requirement.
 
-1. If the pod has permission, lock GPU and memory clocks to a configured
-   supported pair for the benchmark pool.
-2. If clocks cannot be locked, observe and record clocks before and after each
-   batch.
-3. If observed clocks drift beyond tolerance or throttle reasons appear, mark
-   the episode unstable rather than accepting a misleading improvement.
+Preferred order:
 
-Clock locking is a deployment option, not a correctness requirement. The key
-requirement is that the result records whether clocks were controlled or merely
-observed.
+1. Observe and record SM/memory clocks, power, temperature, and throttle or
+   clock-event reasons before, during, and after each batch.
+2. Reject or mark unstable any episode with active thermal, power, HW slowdown,
+   or unexpected clock drift beyond tolerance.
+3. If the pod has administrator/root permission and the GPU supports it, lock
+   GPU and memory clocks to configured supported values for the benchmark pool.
+4. Record whether clocks were `observed_only`, `locked`, or
+   `lock_requested_unavailable`.
+
+Clock locking is useful on dedicated benchmark hosts, but it must not be the
+assumed production path. The hard requirement is that clock state and throttle
+reasons are measured and used in the measurement-quality decision.
 
 ### Concurrency Rule
 
@@ -311,6 +319,8 @@ samples.
     |  elapsed_ms = timed repeated launches                       |
     |  if elapsed_ms < MIN_TIMED_BATCH_MS:                        |
     |      double iterations until threshold or max cap           |
+    |  if elapsed_ms > MAX_TIMED_BATCH_MS:                        |
+    |      reduce iterations or mark calibration warning          |
     |  per_launch_us = elapsed_ms * 1000 / iterations             |
     +---------------------------+---------------------------------+
                                 |
@@ -320,8 +330,14 @@ samples.
 
 ### Metric Modes / Timing Scope
 
-V1 optimizes device-side kernel execution latency. The default metric name
-should be explicit:
+The Benchmarker does not choose the metric mode opportunistically. Metric mode
+is part of `PerformanceObjective` and the operation adapter contract. The
+Benchmarker validates support for the requested mode and returns
+`not_comparable` or `unsupported_metric_mode` if the mode cannot be measured for
+the candidate or adapter.
+
+V1 optimizes device-side kernel execution latency by default. The default metric
+name should be explicit:
 
 ```text
 device_kernel_us
@@ -357,6 +373,12 @@ Useful future metric modes should be named separately:
 | `operator_end_to_end_us` | Adapter-defined full operator path, including transfers or host work if specified | Nothing outside the adapter contract | User-visible latency objectives |
 | `cuda_graph_replay_us` | CUDA graph replay path for supported adapters | Graph capture/build cost unless objective includes it | Microsecond kernels where graph replay changes launch overhead |
 
+CUDA Graph replay is not a Benchmarker heuristic. If the objective requests
+`cuda_graph_replay_us`, the adapter must define graph capture/update/replay
+support and whether graph construction cost is excluded or included. If the
+objective requests `device_kernel_us`, the Benchmarker must use ordinary stream
+launch timing even when a CUDA Graph path would be faster.
+
 ### CUDA Event Timing Path
 
 Use CUDA events in the benchmark stream for kernel elapsed time:
@@ -373,6 +395,19 @@ per_launch_us = elapsed_ms * 1000 / N
 For very short kernels, repeat enough launches per sample to make event and
 launch overhead negligible relative to measured work. The selected `N` must be
 stored in the per-shape result.
+
+CUDA event elapsed time is returned as a floating-point millisecond value, so
+calibration needs both lower and upper bounds:
+
+```text
+MIN_TIMED_BATCH_MS <= elapsed_ms <= MAX_TIMED_BATCH_MS
+```
+
+The lower bound keeps event resolution and launch overhead from dominating. The
+upper bound keeps one sample from becoming so long that clock drift, thermal
+state, and floating-point elapsed-time precision become hidden sources of error.
+If a shape cannot satisfy both bounds within the iteration cap, mark the
+measurement quality as `valid_with_warning` or `unstable` according to policy.
 
 ### Adapter Iteration Semantics
 
@@ -395,6 +430,28 @@ so each measured launch sees equivalent state. For `not_repeatable`, the harness
 must collect one launch per sample and mark launch overhead sensitivity in the
 measurement quality artifact.
 
+### Function Attribute Policy
+
+Runtime function attributes are part of the executable measurement contract. The
+same cubin can behave differently if the harness sets a different dynamic shared
+memory limit or shared-memory/L1 carveout preference.
+
+The measurement envelope should record:
+
+```text
+function_attribute_policy:
+  max_dynamic_shared_memory_size: int | null
+  preferred_shared_memory_carveout_pct: int | null
+  cache_config: "prefer_none" | "prefer_shared" | "prefer_l1" | "prefer_equal" | null
+  cluster_dims: [x, y, z] | null
+  non_portable_cluster_size_allowed: bool | null
+```
+
+If the harness calls `cudaFuncSetAttribute`, `cudaFuncSetCacheConfig`, or driver
+API equivalents, the requested values and the observed function attributes must
+both be retained. A result measured under one carveout policy is not replayable
+as the same benchmark episode under a different policy.
+
 ### Warmup Policy
 
 Warmup is required before collecting samples because first-use effects can
@@ -402,10 +459,14 @@ include context creation, JIT behavior, cache state, memory page touch, clock
 ramp, and allocator initialization. Warmup samples are not reported as
 benchmark samples.
 
-Default cache policy should be `warm_same_buffers` because Kerlever is searching
-for steady-state kernel implementations. Cold-cache benchmarking is valid only
-when the problem objective explicitly requests it, and then the harness must
-define the cache-flush method as part of the measurement envelope.
+Default cache policy depends on measurement shape:
+
+- single-candidate steady-state measurement: `warm_same_buffers`;
+- interleaved batch measurement: `warm_rotating_buffers`.
+
+Cold-cache benchmarking is valid only when the problem objective explicitly
+requests it, and then the harness must define the cache-flush method as part of
+the measurement envelope.
 
 Cache policy should be an explicit enum, not a note:
 
@@ -418,6 +479,16 @@ Cache policy should be an explicit enum, not a note:
 
 The cache policy must be recorded in the measurement envelope because changing
 it changes what the latency means.
+
+If interleaving is enabled and the configured policy is `warm_same_buffers`, the
+Benchmarker should automatically promote the effective policy to
+`warm_rotating_buffers` and record:
+
+```text
+requested_cache_policy: "warm_same_buffers"
+effective_cache_policy: "warm_rotating_buffers"
+cache_policy_reason: "interleaved_batch_requires_rotation"
+```
 
 ---
 
@@ -494,6 +565,17 @@ cubins/modules loaded by a common benchmark harness in one worker process and
 one CUDA context. If the service is using separate executables, it must run
 sequential candidate blocks with incumbent anchors before and after each block.
 
+The block size must be configured, not hand-picked in the harness:
+
+```text
+ANCHOR_EVERY_N_SAMPLES
+MAX_INTERLEAVE_BLOCK_LEN
+```
+
+Short blocks increase sensitivity to drift but add anchor overhead. Long blocks
+reduce anchor overhead but make drift harder to detect. The selected values and
+actual realized block order must be stored in the measurement artifact.
+
 ### ShapeBenchResult
 
 Current shared types can carry the minimum required fields:
@@ -525,8 +607,18 @@ ShapeMeasurementArtifact
   min_us
   max_us
   cache_policy
+  requested_cache_policy
+  effective_cache_policy
+  interleave_block_len
+  anchor_every_n_samples
+  anchor_pre_us
+  anchor_post_us
+  anchor_drift_pct
   artifact_execution_model
   adapter_iteration_semantics
+  metric_mode
+  max_timed_batch_ms
+  function_attribute_policy
   useful_bytes
   actual_bytes | null
   algorithmic_flops
@@ -612,17 +704,17 @@ which candidates survive.
                                 |
                                 v
     +-------------------------------------------------------------+
-    |                    Select Top-K For Profile                 |
+    |                    Select Profile Candidates                |
     |                                                             |
     |  candidates eligible for profile:                           |
     |    - measurement valid                                      |
     |    - correctness already passed                             |
     |    - not regressed beyond guard                             |
     |                                                             |
-    |  rank by:                                                   |
-    |    1. objective score                                       |
-    |    2. lower measurement noise                               |
-    |    3. deterministic candidate hash tie-breaker              |
+    |  profile set:                                               |
+    |    top_k_by_score UNION top_m_by_shift_potential            |
+    |                                                             |
+    |  tie-break by: objective score, measurement noise, hash      |
     +---------------------------+---------------------------------+
                                 |
                                 v
@@ -664,9 +756,21 @@ V1-compatible rule:
 noise_margin_pct = max(
   NOISE_FLOOR_PCT,
   candidate_objective_cv_pct,
-  incumbent_anchor_objective_cv_pct
+  incumbent_anchor_objective_cv_pct,
+  anchor_drift_pct
 )
 ```
+
+Where:
+
+```text
+anchor_drift_pct = abs(anchor_post_score - anchor_pre_score) / anchor_pre_score
+```
+
+Sample CV captures within-episode jitter. Anchor drift captures systematic
+movement across the episode from temperature, clock ramp, power state, or other
+time-correlated effects. If pre/post incumbent anchors differ by 3%, then any
+candidate "improvement" under 3% in that episode is a statistical tie.
 
 This is not a statistical proof. It is a conservative guardrail that prevents
 the search loop from overfitting noise. If a candidate appears to beat the
@@ -700,6 +804,35 @@ noise-sized latency decrease to update the incumbent.
 Stored baseline and incumbent artifacts remain durable search state. Anchor
 measurements are episode-local fairness checks.
 
+### Profile Candidate Selection
+
+Deep profiling only top score winners can starve the search loop of evidence
+from slower but structurally promising candidates. A candidate may regress on
+latency while proving that a major bottleneck has moved, for example much higher
+tensor-pipe activity or a large memory-traffic reduction. That evidence is
+valuable for the Strategy Navigator even when the candidate is not an incumbent.
+
+Profile selection should therefore be:
+
+```text
+profile_candidates =
+  top_k_by_objective_score
+  union top_m_by_bottleneck_shift_potential
+```
+
+`top_m_by_bottleneck_shift_potential` cannot rely on deep-profile counters that
+have not been collected yet. It should use pre-profile signals:
+
+- candidate intent direction and sub-mode;
+- static analysis deltas, such as registers, shared memory, spills, occupancy estimate;
+- fast-benchmark derived throughput, arithmetic intensity, useful bytes, and score shape;
+- novelty relative to the incumbent and recent attempted directions;
+- Cross-Candidate Analyzer hints from earlier rounds, if available.
+
+After profiling, the Benchmarker records measured `bottleneck_shift` against the
+incumbent or previous profiled baseline. The Profile Interpreter can then decide
+whether the shift is actionable.
+
 ---
 
 ## Phase 6 - Deep Profiling Plan
@@ -711,7 +844,8 @@ raw metrics and artifacts for the Profile Interpreter.
     +-------------------------------------------------------------+
     |                    Select Profile Targets                   |
     |                                                             |
-    |  profile candidates: top-K benchmark survivors              |
+    |  profile candidates: top-K score winners plus diagnostic    |
+    |                      candidates with shift potential         |
     |  profile shapes: ShapeCase.profile == true                  |
     |  fallback: best objective shape if no profile shape exists  |
     |  include incumbent profile when comparison is useful        |
@@ -763,6 +897,28 @@ so missing values must be represented as missing, not fabricated.
 The Profile Interpreter turns these measurements into bottleneck tags. The
 Benchmarker only supplies the evidence.
 
+### V1 Replay Coverage
+
+Nsight Compute may replay kernels to collect metric groups. V1 deep-profile
+coverage should be explicit:
+
+| Adapter Iteration Semantics | V1 Deep Profile Status |
+|---|---|
+| `overwrite_pure` | supported |
+| `requires_output_reset` | supported if the adapter provides a safe reset or buffer-rotation path outside the profiled launch |
+| `requires_full_input_reset` | `profile_unavailable` unless the adapter provides a safe restore path |
+| `not_repeatable` | `profile_unavailable` |
+
+When profile is unavailable because of adapter semantics, return:
+
+```text
+profile_status: "profile_unavailable"
+profile_unavailable_reason: "adapter_not_repeatable"
+```
+
+This keeps agents from interpreting missing profile evidence as absence of a
+bottleneck.
+
 ### Nsight Compute Target Selection
 
 The profiler must target the measured kernel, not warmup, anchors, unrelated
@@ -782,6 +938,40 @@ Nsight Compute may replay kernels to collect metric groups. That is acceptable
 for diagnostic counters, but it strengthens the requirement that adapter
 iteration semantics are explicit. Non-repeatable kernels cannot be deep-profiled
 with replay-based collection unless the adapter provides a safe restore path.
+
+### Metric Portability
+
+Profile metric names and semantics vary across GPU architecture and Nsight
+Compute version. The Benchmarker must preserve raw metrics rather than reducing
+them directly into one architecture-specific field.
+
+```text
+RawProfileMetric
+  metric_name: string
+  value: float | int | null
+  unit: string | null
+  architecture: string
+  profiler_name: "ncu"
+  profiler_version: string
+  collection_section: string | null
+```
+
+Normalized aliases such as `tensor_core_utilization_pct` are compact
+convenience fields only. They must include provenance:
+
+```text
+normalized_metrics:
+  tensor_core_utilization_pct:
+    value: float | null
+    source_metrics: [raw metric names]
+    architecture: "sm_80" | "sm_90" | ...
+    profiler_version: string
+    comparable_across_arch: false
+```
+
+The Profile Interpreter should not assume an Ampere tensor metric maps directly
+to Hopper or Blackwell tensor-pipe behavior. Cross-architecture comparability
+requires explicit normalization rules.
 
 ### Nsight Systems Trigger Policy
 
@@ -868,8 +1058,11 @@ ProfileMetrics
   l2_hit_rate_pct
   warp_stall_memory_dependency_pct
   warp_stall_exec_dependency_pct
-  tensor_core_utilization_pct
+  tensor_core_utilization_pct  # compact alias with raw metric provenance
   arithmetic_intensity_flop_per_byte
+  raw_profile_metrics_ref
+  profiler_version
+  profile_arch
 ```
 
 The richer artifacts stay pod-local or artifact-store-local and are referenced
@@ -975,8 +1168,9 @@ The result must distinguish:
 ### Rule 5 - Scheduler Must Prefer Information Per GPU-Second
 
 Fast benchmark all passing candidates before deep profiling. Deep profile only
-top-K survivors and designated profile shapes. Profiling every candidate wastes
-GPU time and slows the search loop without improving ranking quality.
+score winners, diagnostic bottleneck-shift candidates, and designated profile
+shapes. Profiling every candidate wastes GPU time and slows the search loop
+without improving ranking quality.
 
 ---
 
@@ -1073,6 +1267,7 @@ needs a separate metric contract.
 | `GPU_BENCH_CONCURRENCY` | 1 per GPU or MIG instance | Timed benchmark jobs are serialized per leased device |
 | `FAST_BENCH_WARMUP_MIN_RUNS` | small fixed minimum | Minimum untimed launches before sampling |
 | `FAST_BENCH_MIN_TIMED_BATCH_MS` | enough to dwarf event overhead | Minimum elapsed time for one repeated-launch sample |
+| `FAST_BENCH_MAX_TIMED_BATCH_MS` | bounded service default | Maximum elapsed time for one repeated-launch sample before recalibration |
 | `FAST_BENCH_REPETITIONS` | enough for p50 and p95 | Number of timed samples after warmup |
 | `FAST_BENCH_MAX_ITERATIONS_PER_SAMPLE` | bounded cap | Prevents pathological tiny kernels from creating huge loops |
 | `MIN_P95_SAMPLES` | explicit service default | Minimum valid samples before p95 may be treated as available |
@@ -1080,16 +1275,24 @@ needs a separate metric contract.
 | `MEASUREMENT_CV_FAIL_PCT` | service default | Mark measurement unstable above this threshold |
 | `P95_P50_RATIO_WARN` | service default | Detects heavy tail behavior in timing samples |
 | `NOISE_FLOOR_PCT` | nonzero conservative floor | Minimum noise margin for improvement/regression decisions |
+| `ANCHOR_DRIFT_WARN_PCT` | service default | Warning threshold for pre/post incumbent anchor drift |
+| `ANCHOR_DRIFT_FAIL_PCT` | service default | Mark measurement unstable above this anchor drift |
+| `ANCHOR_EVERY_N_SAMPLES` | service default | Controls incumbent anchor cadence inside interleaved batches |
+| `MAX_INTERLEAVE_BLOCK_LEN` | service default | Maximum randomized candidate block length between anchors |
 | `BENCH_RERUN_LIMIT` | 1 or 2 | Retry unstable timing before returning unstable |
 | `ANCHOR_INCUMBENT_POLICY` | same episode | Remeasure incumbent in replacement-eligible batches |
 | `ANCHOR_BASELINE_POLICY` | drift/new-pod triggered | Remeasure baseline when comparability is uncertain |
-| `CACHE_POLICY` | `warm_same_buffers` | Default steady-state cache behavior |
+| `CACHE_POLICY` | single-candidate `warm_same_buffers`; interleaved `warm_rotating_buffers` | Default steady-state cache behavior by measurement mode |
 | `CACHE_FLUSH_BYTES` | adapter/pool specific | Eviction buffer size when cold-cache policy is selected |
-| `CLOCK_POLICY` | lock if privileged, otherwise observe | Clock control and telemetry requirements |
+| `CLOCK_POLICY` | observe + throttle enforcement | Clock telemetry requirement; locking is optional hardening when privileged |
+| `CLOCK_LOCK_POLICY` | disabled unless privileged pool config enables it | Optional GPU/memory clock locking for dedicated benchmark hosts |
 | `THERMAL_STEADY_STATE_LIMIT` | hardware/pool specific | Temperature threshold for valid timing |
-| `TOP_K_PROFILE` | 1-3 | Number of benchmark survivors to deep profile |
+| `TOP_K_PROFILE` | 1-3 | Number of objective-score winners to deep profile |
+| `TOP_M_PROFILE_SHIFT_POTENTIAL` | 1-2 | Diagnostic candidates selected for possible bottleneck migration despite lower score |
 | `NCU_PROFILE_SET` | focused/basic first | Avoid full profiling unless needed |
 | `NCU_TARGET_SELECTION` | NVTX range + launch count | Select the measured candidate/shape launch, not warmup or anchors |
+| `NCU_REPLAY_ADAPTER_POLICY` | overwrite/reset only | V1 profile coverage by adapter iteration semantics |
+| `PROFILE_METRIC_PROVENANCE` | required | Store raw metric names, architecture, profiler version, and normalized aliases |
 | `NSYS_PROFILE_POLICY` | trigger-based | Timeline profiling only for timeline-shaped questions |
 | `PROFILE_TIMEOUT` | fixed service default | Bound profiler runs |
 | `ARTIFACT_RETENTION` | keep raw early | Retain samples and profiler reports while rules mature |
