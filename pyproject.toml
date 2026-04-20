@@ -9,6 +9,13 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+service = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "cuda-python>=12.0",
+]
+
 [project.scripts]
 kerlever = "kerlever.__main__:main"
 
@@ -28,6 +35,10 @@ strict = true
 python_version = "3.12"
 mypy_path = "."
 packages = ["kerlever"]
+
+[[tool.mypy.overrides]]
+module = ["cuda.*", "pynvml", "nvtx", "numpy", "numpy.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 src = ["."]

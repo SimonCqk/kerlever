@@ -1,0 +1,16 @@
+# Exclude venvs, caches, and test artifacts from the Docker context.
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+tests/
+.git/
+.github/
+docs/
+examples/
