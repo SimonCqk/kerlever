@@ -358,11 +358,9 @@ class ElementwiseAddFp32V1:
         """Return the next buffer in a deterministic round-robin order."""
         if not buffers_pool:
             raise ValueError("rotate_buffers called with empty pool")
-        # V1 adapters do not track rotation state; callers that need
-        # rotation own the pool index. We return the first entry so the
-        # call remains well-typed; the Phase 3 harness currently does not
-        # enable rotation for OVERWRITE_PURE adapters.
-        return buffers_pool[0]
+        current = buffers_pool.pop(0)
+        buffers_pool.append(current)
+        return current
 
     def free(self, buffers: AdapterBuffers) -> None:
         """Release every device pointer in the buffer record."""
@@ -510,10 +508,12 @@ class MatmulFp16V1:
         self,
         buffers_pool: list[AdapterBuffers],
     ) -> AdapterBuffers:
-        """Return the first buffer in the pool (stateless rotate)."""
+        """Return the next buffer in a deterministic round-robin order."""
         if not buffers_pool:
             raise ValueError("rotate_buffers called with empty pool")
-        return buffers_pool[0]
+        current = buffers_pool.pop(0)
+        buffers_pool.append(current)
+        return current
 
     def free(self, buffers: AdapterBuffers) -> None:
         """Release every device pointer in the buffer record."""

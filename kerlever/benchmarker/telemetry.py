@@ -296,6 +296,16 @@ _HARD_GATE_REASONS: frozenset[str] = frozenset(
     }
 )
 
+_UNSTABLE_THROTTLE_REASONS: frozenset[str] = frozenset(
+    {
+        "HW_SLOWDOWN",
+        "SW_THERMAL_SLOWDOWN",
+        "HW_THERMAL_SLOWDOWN",
+        "HW_POWER_BRAKE_SLOWDOWN",
+        "SW_POWER_CAP",
+    }
+)
+
 
 def is_hard_gate(reason: str | None) -> bool:
     """Return ``True`` when ``reason`` is a Phase 2 hard-gate failure.
@@ -353,6 +363,13 @@ def preflight(
         and reason is None
     ):
         reason = "thermal_above_steady_state"
+    if foreign and reason is None:
+        reason = "foreign_compute_process"
+    if (
+        any(r in _UNSTABLE_THROTTLE_REASONS for r in throttle_reasons)
+        and reason is None
+    ):
+        reason = "clock_throttle"
 
     profiler_perm = _probe_profiler_counter_permission()
 

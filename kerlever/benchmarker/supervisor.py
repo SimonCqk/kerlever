@@ -115,9 +115,7 @@ class Supervisor:
         times out (REQ-BENCH-035, INV-BENCH-016). The
         ``KEEP_STAGED_ARTIFACTS`` env var overrides cleanup for debugging.
         """
-        pre_hygiene = await asyncio.to_thread(
-            preflight, device, self._cfg.clock_policy, self._cfg.thresholds
-        )
+        pre_hygiene = await self._preflight_with_retry(device)
         if is_hard_gate(pre_hygiene.reason_on_fail):
             logger.warning(
                 "supervisor.hard_gate",
@@ -131,6 +129,19 @@ class Supervisor:
                 pod_health=PodHealth.QUARANTINED
                 if pre_hygiene.reason_on_fail == "ecc_xid"
                 else pod_health,
+                ambiguous_count=ambiguous_count,
+            )
+        if pre_hygiene.reason_on_fail is not None:
+            logger.warning(
+                "supervisor.unstable_hygiene_gate",
+                extra={
+                    "reason": pre_hygiene.reason_on_fail,
+                    "gpu_uuid": device.gpu_uuid,
+                },
+            )
+            return FinalizedBatch(
+                result=self._unstable_gate_result(req, device, pre_hygiene),
+                pod_health=pod_health,
                 ambiguous_count=ambiguous_count,
             )
 
@@ -189,16 +200,30 @@ class Supervisor:
             # successful batch result.
             self._cleanup_staging(staging_dir, batch_id=req.batch_id)
 
+    async def _preflight_with_retry(self, device: LeasedDevice) -> HygieneReport:
+        """Run preflight, retrying retryable unstable hygiene gates."""
+        attempts = max(0, self._cfg.calibration.bench_rerun_limit)
+        last = await asyncio.to_thread(
+            preflight, device, self._cfg.clock_policy, self._cfg.thresholds
+        )
+        for _attempt in range(attempts):
+            if last.reason_on_fail is None or is_hard_gate(last.reason_on_fail):
+                return last
+            await asyncio.sleep(0.5)
+            last = await asyncio.to_thread(
+                preflight, device, self._cfg.clock_policy, self._cfg.thresholds
+            )
+        return last
+
     def _stage_worker_inputs(
         self, req: BenchmarkBatchRequest
     ) -> tuple[Path, Path, Path, Path]:
         """Persist request + config under ``<artifact_root>/staging/<batch_id>/``.
 
         The staging directory lives under ``staging/<batch_id>/`` so the
-        ``finally`` block in :meth:`run_batch` can recursively remove every
-        artifact produced by the batch — worker request/config/result plus
-        the NCU reports written into ``staging/<batch_id>/ncu/`` by the
-        worker (spec REQ-BENCH-035 / INV-BENCH-016 / SC-BENCH-016).
+        ``finally`` block in :meth:`run_batch` can recursively remove worker
+        request/config/result scratch files. Durable sample, raw-metric, and
+        NCU artifacts are written outside staging under the artifact root.
 
         Returns:
             ``(staging_dir, req_path, cfg_path, res_path)``.
@@ -476,6 +501,39 @@ class Supervisor:
             failure_reason=pre_hygiene.reason_on_fail,
         )
 
+    def _unstable_gate_result(
+        self,
+        req: BenchmarkBatchRequest,
+        device: LeasedDevice,
+        pre_hygiene: HygieneReport,
+    ) -> BenchmarkBatchResult:
+        """Construct the unstable response for retry-exhausted hygiene gates."""
+        return BenchmarkBatchResult(
+            status=BatchStatus.UNSTABLE,
+            run_envelope=_run_envelope_from_supervisor(
+                req, self._cfg, device, PodHealth.HEALTHY, 0
+            ),
+            measurement_context=MeasurementContext(
+                artifact_execution_model=req.artifact_execution_model,
+                metric_mode=req.metric_mode,
+                cache_policy_requested=req.cache_policy,
+                cache_policy_effective=req.cache_policy,
+                clock_policy=req.clock_policy,
+                interleave_enabled=False,
+                noise_floor_pct=self._cfg.thresholds.noise_floor_pct,
+                guard_pct=req.problem_spec.objective.regression_guard_pct,
+            ),
+            hygiene=pre_hygiene,
+            incumbent_anchor=IncumbentAnchor(
+                incumbent_artifact_id=req.incumbent_ref.artifact_id,
+                shape_results=[],
+                objective_score=req.incumbent_ref.objective_score,
+            ),
+            candidate_results=[],
+            top_k_profiled=[],
+            failure_reason=pre_hygiene.reason_on_fail,
+        )
+
 
 def _run_envelope_from_supervisor(
     req: BenchmarkBatchRequest,
@@ -518,6 +576,8 @@ def ensure_artifact_root(cfg: BenchmarkerConfig) -> None:
     try:
         cfg.artifact.root.mkdir(parents=True, exist_ok=True)
         (cfg.artifact.root / "ncu").mkdir(exist_ok=True)
+        (cfg.artifact.root / "raw_metrics").mkdir(exist_ok=True)
+        (cfg.artifact.root / "samples").mkdir(exist_ok=True)
         (cfg.artifact.root / "worker").mkdir(exist_ok=True)
         # REQ-BENCH-035: staging dirs are created per-batch under here; we
         # pre-create the top-level so a read-only fallback is detected early.

@@ -33,6 +33,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip --break-system-packages 
       "uvicorn[standard]>=0.27" \
       "cuda-python>=12.3" \
       "pynvml>=11.5" \
+      "nvtx>=0.2" \
       "numpy>=1.26" \
       "pydantic>=2.5" \
       "anthropic>=0.40" \

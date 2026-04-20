@@ -18,9 +18,12 @@ Design: docs/benchmarker/design.md §3.2, §4.3
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import math
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -107,6 +110,7 @@ from kerlever.benchmarker.types import (
     MeasurementQualityStatus,
     MetricMode,
     PodHealth,
+    ProfileArtifactRef,
     ProfileBundle,
     ProfilerName,
     ProfileStatus,
@@ -169,6 +173,85 @@ def _write_result(path: Path, result: BenchmarkBatchResult) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(result.model_dump_json())
     os.replace(tmp, path)
+
+
+_ARTIFACT_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_artifact_token(value: str) -> str:
+    """Return a filesystem-safe token for pod-local artifact paths."""
+    safe = _ARTIFACT_TOKEN_RE.sub("_", value).strip("._")
+    return safe or "empty"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Atomically write a text artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _artifact_id(kind: str, batch_id: str, filename: str) -> str:
+    """Build the opaque artifact id used in response references."""
+    return f"{kind}/{_safe_artifact_token(batch_id)}/{filename}"
+
+
+def _artifact_path(root: Path, kind: str, batch_id: str, filename: str) -> Path:
+    """Resolve a durable artifact path under the pod-local artifact root."""
+    return root / kind / _safe_artifact_token(batch_id) / filename
+
+
+def _write_shape_artifact(
+    root: Path,
+    batch_id: str,
+    candidate_hash: str,
+    shape_id: str,
+    artifact: ShapeMeasurementArtifact,
+) -> str:
+    """Persist a ShapeMeasurementArtifact and return its artifact id."""
+    filename = (
+        f"{_safe_artifact_token(candidate_hash)}_"
+        f"{_safe_artifact_token(shape_id)}.json"
+    )
+    path = _artifact_path(root, "samples", batch_id, filename)
+    _write_text_atomic(path, artifact.model_dump_json())
+    return _artifact_id("samples", batch_id, filename)
+
+
+def _write_raw_metrics_artifact(
+    root: Path,
+    batch_id: str,
+    candidate_hash: str,
+    shape_id: str,
+    raw: list[RawProfileMetric],
+) -> ProfileArtifactRef:
+    """Persist raw profiler metrics and return a typed artifact reference."""
+    filename = (
+        f"{_safe_artifact_token(candidate_hash)}_"
+        f"{_safe_artifact_token(shape_id)}.json"
+    )
+    path = _artifact_path(root, "raw_metrics", batch_id, filename)
+    payload = json.dumps([m.model_dump() for m in raw], separators=(",", ":"))
+    _write_text_atomic(path, payload)
+    return ProfileArtifactRef(
+        artifact_id=_artifact_id("raw_metrics", batch_id, filename),
+        kind="raw_metrics_json",
+        uri=str(path),
+        size_bytes=path.stat().st_size,
+        created_at_ms=int(time.time() * 1000),
+    )
+
+
+def _ncu_artifact_ref(path: Path, batch_id: str) -> ProfileArtifactRef:
+    """Build a typed artifact reference for a durable NCU report."""
+    return ProfileArtifactRef(
+        artifact_id=_artifact_id("ncu", batch_id, path.name),
+        kind="ncu_report",
+        uri=str(path),
+        size_bytes=path.stat().st_size,
+        created_at_ms=int(time.time() * 1000),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +353,9 @@ def _dry_launcher(
 
 
 def _cuda_calibration_launcher(
-    stream_handle: object, build_args: object
+    stream_handle: object,
+    build_args: object,
+    resolve_grid_dim: Callable[[LoadedCandidate, object], tuple[int, int, int]],
 ) -> object:
     """Return a launcher that runs one calibration sample on the GPU.
 
@@ -293,7 +378,7 @@ def _cuda_calibration_launcher(
                 args = build_args(cand, shape)  # type: ignore[operator]
                 cd.launch(
                     cand.function,
-                    cand.grid_dim or (1, 1, 1),
+                    resolve_grid_dim(cand, shape),
                     cand.block_dim,
                     cand.dynamic_smem_bytes,
                     stream_handle,  # type: ignore[arg-type]
@@ -311,6 +396,7 @@ def _cuda_calibration_launcher(
 
 def _load_candidates(
     admit: list[CandidateArtifactRef],
+    adapter: OperationAdapter,
 ) -> tuple[
     list[LoadedCandidate],
     dict[str, FunctionAttributePolicy],
@@ -393,7 +479,7 @@ def _load_candidates(
                 candidate_hash=ref.candidate_hash,
                 function=fn,
                 launch_args_factory=None,
-                adapter_iteration_semantics=ref.adapter_iteration_semantics,
+                adapter_iteration_semantics=adapter.iteration_semantics,
                 function_attribute_policy_observed=observed,
                 block_dim=ref.launch_spec.block_dim,
                 grid_dim=ref.launch_spec.grid_dim,
@@ -475,9 +561,12 @@ def _adapter_seed(
     Spec §6.11 requires the profile child to re-seed with the *same* value
     so the profiled launch reads the same inputs the measurement saw.
     """
-    return hash(
-        (run_id, batch_id, shape_id, candidate_hash, "kerlever_profile_seed")
+    key = (
+        f"{run_id}|{batch_id}|{shape_id}|{candidate_hash}|"
+        "kerlever_profile_seed"
     )
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False)
 
 
 def _allocate_shape_buffers(
@@ -491,6 +580,9 @@ def _allocate_shape_buffers(
     batch_id: str,
     dtype: str,
     out: dict[tuple[str, str], AdapterBuffers],
+    pools: dict[tuple[str, str], list[AdapterBuffers]],
+    allocated: list[AdapterBuffers],
+    pool_size: int,
 ) -> None:
     """Allocate + seed one :class:`AdapterBuffers` per (candidate, shape) pair.
 
@@ -509,12 +601,18 @@ def _allocate_shape_buffers(
                 raise TypeError(
                     f"_allocate_shape_buffers expects ShapeCase; got {type(shape)!r}"
                 )
-            bufs = adapter.allocate(shape, dtype, device)
             seed = _adapter_seed(
                 run_id, batch_id, shape.shape_id, cand.candidate_hash
             )
-            adapter.seed_inputs(bufs, shape, seed)
-            out[(cand.candidate_hash, shape.shape_id)] = bufs
+            key = (cand.candidate_hash, shape.shape_id)
+            pool: list[AdapterBuffers] = []
+            for _ in range(max(1, pool_size)):
+                bufs = adapter.allocate(shape, dtype, device)
+                adapter.seed_inputs(bufs, shape, seed)
+                pool.append(bufs)
+                allocated.append(bufs)
+            pools[key] = pool
+            out[key] = pool[0]
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +884,8 @@ def _run_phases(
     per_shape_buffers: dict[tuple[str, str], AdapterBuffers] = {}
     try:
         loaded, observed_policies, load_rejects = _load_candidates(
-            normalized.admit_candidates
+            normalized.admit_candidates,
+            adapter,
         )
         # Accumulate load-time rejections into normalized.reject_candidates so
         # the final candidate_results surface them. Build a mutable dict
@@ -800,7 +899,18 @@ def _run_phases(
             for h, reason in load_rejects.items()
         }
         # Incumbent load (when the request carries a cubin).
-        incumbent_loaded = _load_incumbent(req, loaded)
+        incumbent_loaded = _load_incumbent(req, adapter)
+
+        def _resolve_grid_dim(
+            cand: LoadedCandidate, shape: object
+        ) -> tuple[int, int, int]:
+            from kerlever.benchmarker.types import (
+                ShapeCase as _ShapeCase,  # noqa: PLC0415
+            )
+
+            if not isinstance(shape, _ShapeCase):
+                raise TypeError(f"expected ShapeCase, got {type(shape)!r}")
+            return cand.grid_dim or adapter.grid_dim(shape, cand.block_dim)
 
         # Phase 3: calibration.
         calibration_launcher = _cuda_calibration_launcher(
@@ -808,10 +918,18 @@ def _run_phases(
             lambda cand, shape: _build_args_for(
                 adapter, per_shape_buffers, cand, shape
             ),
+            _resolve_grid_dim,
         )
         # Allocate + seed buffers for every shape (objective + profile).
         all_shapes = list(req.objective_shape_cases) + list(
             req.profile_shape_cases
+        )
+        buffer_pools: dict[tuple[str, str], list[AdapterBuffers]] = {}
+        allocated_buffers: list[AdapterBuffers] = []
+        pool_size = (
+            max(2, cfg.calibration.max_interleave_block_len)
+            if normalized.effective_cache_policy == CachePolicy.WARM_ROTATING_BUFFERS
+            else 1
         )
         _allocate_shape_buffers(
             adapter=adapter,
@@ -823,7 +941,25 @@ def _run_phases(
             batch_id=req.batch_id,
             dtype=req.problem_spec.dtype,
             out=per_shape_buffers,
+            pools=buffer_pools,
+            allocated=allocated_buffers,
+            pool_size=pool_size,
         )
+
+        def _before_sample(cand: LoadedCandidate, shape: object) -> None:
+            from kerlever.benchmarker.types import (
+                ShapeCase as _ShapeCase,  # noqa: PLC0415
+            )
+
+            if normalized.effective_cache_policy != CachePolicy.WARM_ROTATING_BUFFERS:
+                return
+            if not isinstance(shape, _ShapeCase):
+                raise TypeError(f"expected ShapeCase, got {type(shape)!r}")
+            key = (cand.candidate_hash, shape.shape_id)
+            pool = buffer_pools.get(key)
+            if not pool:
+                raise RuntimeError(f"missing buffer pool for {key}")
+            per_shape_buffers[key] = adapter.rotate_buffers(pool)
 
         plan_out = calibrate(
             candidates=loaded,
@@ -868,7 +1004,9 @@ def _run_phases(
             build_args=lambda cand, shape: _build_args_for(
                 adapter, per_shape_buffers, cand, shape
             ),
+            resolve_grid_dim=_resolve_grid_dim,
             reset_hook_per_candidate=reset_hooks,
+            before_sample=_before_sample,
         )
 
         # Phase 4 postflight telemetry — REQ-BENCH-032 binds this snapshot
@@ -919,7 +1057,13 @@ def _run_phases(
         candidate_results: list[CandidateResult] = []
         for cand in loaded:
             envelope = normalized.envelope_per_candidate[cand.candidate_hash]
-            shape_results, artifact_refs, quality_statuses, cand_cv_pct = (
+            (
+                shape_results,
+                artifact_refs,
+                quality_statuses,
+                quality_reasons,
+                cand_cv_pct,
+            ) = (
                 _assemble_candidate_shapes(
                     cand,
                     batch_meas,
@@ -939,7 +1083,9 @@ def _run_phases(
                 incumbent_anchor_value=max(incumbent_score.value, 1e-9),
             )
             anchor_drift = _aggregate_anchor_drift(batch_meas)
-            if incumbent_envelope is None:
+            if not math.isfinite(cand_score.value):
+                comparison = IncumbentComparison.NOT_COMPARABLE
+            elif incumbent_envelope is None:
                 # INV-BENCH-015: no real incumbent envelope available →
                 # refuse to fabricate one; mark not_comparable.
                 comparison = IncumbentComparison.NOT_COMPARABLE
@@ -965,6 +1111,7 @@ def _run_phases(
                 )
             )
             worst_quality = _worst_quality(list(quality_statuses.values()))
+            quality_reason = _first_quality_reason(quality_reasons, worst_quality)
             fault_cls = _fault_for_candidate(cand, batch_meas, worst_quality)
             bundle = BenchmarkBundle(
                 shape_results=shape_results,
@@ -985,7 +1132,7 @@ def _run_phases(
                     benchmark=bundle,
                     incumbent_comparison=comparison,
                     measurement_quality=worst_quality,
-                    measurement_quality_reason=None,
+                    measurement_quality_reason=quality_reason,
                     shape_measurement_artifact_refs=artifact_refs,
                     profile_status=ProfileStatus.PROFILE_UNAVAILABLE,
                     profile_unavailable_reason=None,
@@ -1058,57 +1205,60 @@ def _run_phases(
         )
     finally:
         # Free adapter buffers before destroying the context.
-        for key, bufs in list(per_shape_buffers.items()):
+        buffers_to_free = (
+            allocated_buffers
+            if "allocated_buffers" in locals()
+            else list(per_shape_buffers.values())
+        )
+        seen_buffer_ids: set[int] = set()
+        for bufs in buffers_to_free:
+            buf_id = id(bufs)
+            if buf_id in seen_buffer_ids:
+                continue
+            seen_buffer_ids.add(buf_id)
             try:
                 adapter.free(bufs)
             except Exception as exc:  # noqa: BLE001 — teardown best-effort
                 logger.warning(
                     "worker.adapter.free_failed",
-                    extra={"key": key, "error": str(exc)},
+                    extra={"error": str(exc)},
                 )
         cd.destroy_stream(stream)
         cd.destroy_primary_context(ctx)
 
 
 def _load_incumbent(
-    req: BenchmarkBatchRequest, loaded: list[LoadedCandidate]
+    req: BenchmarkBatchRequest, adapter: OperationAdapter
 ) -> LoadedCandidate:
     """Return a LoadedCandidate representing the incumbent anchor.
 
-    If the request carries a ``cubin_uri`` and ``launch_spec`` for the
-    incumbent we load it. Otherwise we synthesize a reference that points
-    at the first loaded candidate's function; this makes the anchor path
-    always runnable (for a V1 bring-up), while allowing future requests to
-    supply a real incumbent binary.
+    Phase 1 normalization requires incumbent cubin + launch metadata, so this
+    function never fabricates an anchor from a candidate.
     """
-    if (
-        req.incumbent_ref.cubin_uri is None
-        or req.incumbent_ref.launch_spec is None
-    ):
-        if loaded:
-            base = loaded[0]
-            return LoadedCandidate(
-                candidate_hash="__incumbent__",
-                function=base.function,
-                launch_args_factory=None,
-                adapter_iteration_semantics=base.adapter_iteration_semantics,
-                function_attribute_policy_observed=base.function_attribute_policy_observed,
-                block_dim=base.block_dim,
-                grid_dim=base.grid_dim,
-                dynamic_smem_bytes=base.dynamic_smem_bytes,
-            )
-        raise RuntimeError("incumbent has no cubin and no fallback candidate")
     from kerlever.benchmarker import cuda_driver as cd  # noqa: PLC0415
+    from kerlever.benchmarker.types import FunctionAttribute  # noqa: PLC0415
 
+    if req.incumbent_ref.cubin_uri is None or req.incumbent_ref.launch_spec is None:
+        raise RuntimeError("incumbent artifact required")
     cubin = Path(req.incumbent_ref.cubin_uri).read_bytes()
     module = cd.load_module(cubin, None)
     fn = cd.get_function(module, req.incumbent_ref.launch_spec.entrypoint)
+    observed = FunctionAttributePolicy()
+    if req.incumbent_ref.launch_spec.dynamic_smem_bytes > 0:
+        observed_smem = cd.set_function_attribute(
+            fn,
+            FunctionAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            int(req.incumbent_ref.launch_spec.dynamic_smem_bytes),
+        )
+        observed = observed.model_copy(
+            update={"max_dynamic_shared_memory_size": observed_smem}
+        )
     return LoadedCandidate(
         candidate_hash="__incumbent__",
         function=fn,
         launch_args_factory=None,
-        adapter_iteration_semantics=AdapterIterationSemantics.OVERWRITE_PURE,
-        function_attribute_policy_observed=FunctionAttributePolicy(),
+        adapter_iteration_semantics=adapter.iteration_semantics,
+        function_attribute_policy_observed=observed,
         block_dim=req.incumbent_ref.launch_spec.block_dim,
         grid_dim=req.incumbent_ref.launch_spec.grid_dim,
         dynamic_smem_bytes=req.incumbent_ref.launch_spec.dynamic_smem_bytes,
@@ -1234,6 +1384,7 @@ def _assemble_candidate_shapes(
     list[ShapeBenchResult],
     dict[str, str],
     dict[str, MeasurementQualityStatus],
+    dict[str, str],
     float | None,
 ]:
     """Build compact shape results + artifact refs + quality statuses.
@@ -1244,9 +1395,13 @@ def _assemble_candidate_shapes(
     shape_results: list[ShapeBenchResult] = []
     artifact_refs: dict[str, str] = {}
     quality: dict[str, MeasurementQualityStatus] = {}
+    quality_reasons: dict[str, str] = {}
     all_cvs: list[float] = []
     for shape_id, per_shape in batch_meas.per_shape.items():
         samples = per_shape.candidate_samples.get(cand.candidate_hash, [])
+        runtime_fault = batch_meas.runtime_faults.get(cand.candidate_hash, {}).get(
+            shape_id
+        )
         ctx = _shape_artifact_context(
             shape_id=shape_id,
             per_shape=per_shape,
@@ -1266,20 +1421,39 @@ def _assemble_candidate_shapes(
             ctx,
             thresholds=cfg.thresholds,
         )
-        shape_results.append(compact)
-        # The artifact id here is synthesized (real artifact store writes happen
-        # service-side in §4.1); this id is opaque and stable per batch_id.
-        artifact_refs[shape_id] = (
-            f"art:{cand.candidate_hash}:{shape_id}"
-        )
         status = _shape_quality_status(
-            compact, artifact, plan_out, cand.candidate_hash, shape_id, cfg
+            compact,
+            artifact,
+            plan_out,
+            cand.candidate_hash,
+            shape_id,
+            cfg,
+            runtime_fault=runtime_fault,
+        )
+        if status != artifact.measurement_quality.status or runtime_fault is not None:
+            artifact = artifact.model_copy(
+                update={
+                    "measurement_quality": MeasurementQuality(
+                        status=status,
+                        reason=runtime_fault,
+                    )
+                }
+            )
+        shape_results.append(compact)
+        artifact_refs[shape_id] = _write_shape_artifact(
+            cfg.artifact.root,
+            req.batch_id,
+            cand.candidate_hash,
+            shape_id,
+            artifact,
         )
         quality[shape_id] = status
+        if runtime_fault is not None:
+            quality_reasons[shape_id] = runtime_fault
         if artifact.cv_pct is not None:
             all_cvs.append(artifact.cv_pct)
     candidate_cv = max(all_cvs) if all_cvs else None
-    return shape_results, artifact_refs, quality, candidate_cv
+    return shape_results, artifact_refs, quality, quality_reasons, candidate_cv
 
 
 def _compute_incumbent_cv_pct(batch_meas: BatchMeasurement) -> float | None:
@@ -1389,8 +1563,11 @@ def _shape_quality_status(
     candidate_hash: str,
     shape_id: str,
     cfg: BenchmarkerConfig,
+    runtime_fault: str | None = None,
 ) -> MeasurementQualityStatus:
     """Classify a shape's quality per spec §6.4 decision table."""
+    if runtime_fault is not None:
+        return MeasurementQualityStatus.RUNTIME_FAULT
     # No samples → infra_fault.
     if compact.run_count == 0:
         return MeasurementQualityStatus.INFRA_FAULT
@@ -1449,6 +1626,18 @@ def _worst_quality(
         if candidate_status in statuses:
             return candidate_status
     return MeasurementQualityStatus.VALID
+
+
+def _first_quality_reason(
+    reasons: dict[str, str],
+    worst: MeasurementQualityStatus,
+) -> str | None:
+    """Return the first quality reason worth surfacing at candidate level."""
+    _ = worst
+    if not reasons:
+        return None
+    shape_id = sorted(reasons.keys())[0]
+    return f"{shape_id}:{reasons[shape_id]}"
 
 
 def _fault_for_candidate(
@@ -1607,15 +1796,14 @@ def _run_profile_phase(
             nvtx_range = build_nvtx_range(
                 req.run_id, req.batch_id, cand.candidate_hash, shape.shape_id
             )
-            # REQ-BENCH-035 / INV-BENCH-016: NCU reports are written into
-            # the per-batch staging directory so the supervisor's staging
-            # cleanup removes them together with request.json / config.json.
             report_out = (
                 cfg.artifact.root
-                / "staging"
-                / req.batch_id
                 / "ncu"
-                / f"{cand.candidate_hash}_{shape.shape_id}.ncu-rep"
+                / _safe_artifact_token(req.batch_id)
+                / (
+                    f"{_safe_artifact_token(cand.candidate_hash)}_"
+                    f"{_safe_artifact_token(shape.shape_id)}.ncu-rep"
+                )
             )
             report_out.parent.mkdir(parents=True, exist_ok=True)
             sp = plan_out.sample_plans.get(
@@ -1665,6 +1853,9 @@ def _run_profile_phase(
                 if first_reason is None:
                     first_reason = reason
                 continue
+            cres.profile_artifact_refs.append(
+                _ncu_artifact_ref(ncu_result.report_path, req.batch_id)
+            )
             raw = parse_report(
                 cfg.profiler,
                 ncu_result.report_path,
@@ -1676,6 +1867,14 @@ def _run_profile_phase(
                 arch=device.sm_arch,
                 profiler_version=ncu_version(cfg.profiler) or "unknown",
             )
+            raw_ref = _write_raw_metrics_artifact(
+                cfg.artifact.root,
+                req.batch_id,
+                cand.candidate_hash,
+                shape.shape_id,
+                raw,
+            )
+            cres.profile_artifact_refs.append(raw_ref)
             cres.profile_bundles.append(
                 ProfileBundle(
                     shape_id=shape.shape_id,
@@ -1692,9 +1891,11 @@ def _run_profile_phase(
         if cres.profile_bundles:
             cres.profile_status = ProfileStatus.PRESENT
             cres.profile_unavailable_reason = None
-            cres.raw_profile_metrics_ref = (
-                f"art:raw:{cand.candidate_hash}"
-            )
+            if cres.raw_profile_metrics_ref is None:
+                for ref in cres.profile_artifact_refs:
+                    if ref.kind == "raw_metrics_json":
+                        cres.raw_profile_metrics_ref = ref.artifact_id
+                        break
         else:
             cres.profile_status = ProfileStatus.PROFILE_UNAVAILABLE
             cres.profile_unavailable_reason = first_reason

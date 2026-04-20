@@ -367,6 +367,11 @@ def create_app(config: BenchmarkerConfig | None = None) -> FastAPI:
         Implements: REQ-BENCH-023
         """
         env: ServiceEnv = request.app.state.env
+        from kerlever.benchmarker.adapter import list_registered  # noqa: PLC0415
+
+        supported = list(env.config.supported_adapter_abis) or [
+            abi for abi, _version in list_registered()
+        ]
         return InfoResponse(
             service_version=env.config.service_version,
             build_hash=env.config.build_hash,
@@ -374,7 +379,7 @@ def create_app(config: BenchmarkerConfig | None = None) -> FastAPI:
             gpus=env.inventory_entries,
             default_metric_mode=MetricMode.DEVICE_KERNEL_US,
             artifact_execution_model=ArtifactExecutionModel.COMMON_HARNESS_CUBIN,
-            supported_adapter_abis=list(env.config.supported_adapter_abis),
+            supported_adapter_abis=supported,
             thresholds=_threshold_map(env.config),
         )
 
@@ -398,19 +403,36 @@ def _threshold_map(cfg: BenchmarkerConfig) -> dict[str, float]:
 def _resolve_sm_arch(req: BenchmarkBatchRequest) -> str:
     """Derive ``sm_arch`` from the request.
 
-    The ``ProblemSpec`` does not carry ``sm_arch`` directly; we accept a
-    free-form ``target_gpu`` like ``"H100-SXM5"`` and let the deployment
-    map it via a future policy. For V1, if the request includes candidates
-    that were compiled against a specific arch, we read the arch from the
-    first candidate's :attr:`CandidateArtifactRef.toolchain_hash` is
-    insufficient; instead we accept any arch and delegate matching to the
-    lease manager via the inventory's reported ``sm_arch``. We return
-    the literal ``target_gpu`` string so the inventory match uses it.
+    ``ProblemSpec.target_gpu`` is user-facing and often carries a SKU
+    (``"A100"``, ``"H100-SXM5-80G"``), while NVML inventory carries
+    CUDA architecture strings (``"sm_80"``, ``"sm_90"``). V1 keeps this as
+    a small explicit mapping instead of adding another config surface.
     """
-    # Deliberately return the target string; lease.find_compatible checks
-    # inventory sm_arch against this value. For a real deployment this
-    # should be replaced with a configured SKU→sm_arch map.
-    return req.problem_spec.target_gpu
+    target = req.problem_spec.target_gpu.strip()
+    lowered = target.lower().replace("-", "_").replace(" ", "_")
+    if lowered.startswith("sm_") and lowered[3:].isdigit():
+        return lowered
+    if lowered.startswith("sm") and lowered[2:].isdigit():
+        return f"sm_{lowered[2:]}"
+    sku_to_arch = {
+        "a100": "sm_80",
+        "a30": "sm_80",
+        "h100": "sm_90",
+        "h200": "sm_90",
+        "l4": "sm_89",
+        "l40": "sm_89",
+        "l40s": "sm_89",
+        "rtx_4090": "sm_89",
+        "a10": "sm_86",
+        "a40": "sm_86",
+        "a6000": "sm_86",
+        "v100": "sm_70",
+        "t4": "sm_75",
+    }
+    for token, arch in sku_to_arch.items():
+        if token in lowered:
+            return arch
+    return target
 
 
 def _has_fault_class(

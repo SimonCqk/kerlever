@@ -10,8 +10,9 @@ Design: docs/benchmarker/design.md
 
 from __future__ import annotations
 
+from typing import Any
+
 from kerlever.benchmarker.config import BenchmarkerConfig
-from kerlever.benchmarker.service import create_app
 from kerlever.benchmarker.types import (
     AdapterIterationSemantics,
     ArtifactExecutionModel,
@@ -35,6 +36,18 @@ from kerlever.benchmarker.types import (
     ProfileUnavailableReason,
     ShapeMeasurementArtifact,
 )
+
+
+def create_app(*args: Any, **kwargs: Any) -> Any:
+    """Lazily build the FastAPI app.
+
+    Keeping this import lazy lets pure benchmarker modules and dry-run tooling
+    import ``kerlever.benchmarker`` without requiring the service extra.
+    """
+    from kerlever.benchmarker.service import create_app as _create_app
+
+    return _create_app(*args, **kwargs)
+
 
 __all__ = [
     "AdapterIterationSemantics",

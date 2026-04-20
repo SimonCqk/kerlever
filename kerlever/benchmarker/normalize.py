@@ -31,6 +31,7 @@ from kerlever.benchmarker.types import (
     ClockPolicy,
     FaultClass,
     MeasurementEnvelope,
+    MetricMode,
     RepeatPolicy,
     WarmupPolicy,
 )
@@ -163,6 +164,11 @@ def normalize_request(
         raise NormalizationError("empty_batch", "no candidate refs provided")
     if not req.run_id:
         raise NormalizationError("missing_run_id", "run_id is required")
+    if req.metric_mode != MetricMode.DEVICE_KERNEL_US:
+        raise NormalizationError(
+            "unsupported_metric_mode",
+            f"V1 supports only {MetricMode.DEVICE_KERNEL_US.value}",
+        )
 
     # Operation adapter compat: V1 admits any registered ABI matching request.
     admitted_abis = cfg.supported_adapter_abis
@@ -187,15 +193,28 @@ def normalize_request(
             f"{req.operation_adapter_version!r} is not registered",
         )
 
-    # REQ-BENCH-031: incumbent's cubin_uri (when present) must also satisfy
-    # the V1 absolute-readable-path contract.
-    if req.incumbent_ref.cubin_uri is not None:
-        reason = _validate_cubin_uri(req.incumbent_ref.cubin_uri)
-        if reason is not None:
-            raise NormalizationError(
-                reason,
-                f"incumbent cubin_uri invalid: {req.incumbent_ref.cubin_uri!r}",
-            )
+    missing_incumbent = [
+        name
+        for name, value in (
+            ("cubin_uri", req.incumbent_ref.cubin_uri),
+            ("launch_spec", req.incumbent_ref.launch_spec),
+            ("launch_spec_hash", req.incumbent_ref.launch_spec_hash),
+            ("source_hash", req.incumbent_ref.source_hash),
+            ("toolchain_hash", req.incumbent_ref.toolchain_hash),
+        )
+        if value is None
+    ]
+    if missing_incumbent:
+        raise NormalizationError(
+            "incumbent_artifact_required",
+            "incumbent_ref missing " + ",".join(missing_incumbent),
+        )
+    reason = _validate_cubin_uri(req.incumbent_ref.cubin_uri)
+    if reason is not None:
+        raise NormalizationError(
+            reason,
+            f"incumbent cubin_uri invalid: {req.incumbent_ref.cubin_uri!r}",
+        )
 
     # Top-K / top-M guard (spec §6.1 step 7).
     if req.top_k_profile < 0 or req.top_m_profile_shift_potential < 0:

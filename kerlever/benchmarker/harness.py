@@ -2,7 +2,7 @@
 
 Responsible for:
 
-* ``generate_block_order`` — deterministic PCG64-seeded permutation of
+* ``generate_block_order`` — deterministic seeded permutation of
   ``[anchor, candidate...]`` tokens (spec §6.4, INV-BENCH-004).
 * ``run_sample`` — single-sample CUDA event timing with optional NVTX
   wrap (only the ONE profiled launch per tuple gets wrapped — INV-BENCH-008).
@@ -16,6 +16,7 @@ Design: docs/benchmarker/design.md §2.1 harness.py
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -106,14 +107,14 @@ def generate_block_order(
     * Block length is ``min(max_block_len, anchor_every_n)`` — spec wording.
     * Total candidate emissions equal ``total_repetitions * len(candidates)``
       so every candidate collects exactly ``total_repetitions`` samples.
-    * Seed comes from ``hash((run_id, batch_id, shape_id, "kerlever_benchmark_order"))``
+    * Seed comes from the stable per-shape seed produced during normalization
       (INV-BENCH-004).
 
     Args:
         candidates: Candidate-hash tokens.
         anchor_every_n: Anchor cadence between blocks.
         max_block_len: Hard upper bound on block size.
-        seed: PCG64 seed.
+        seed: Stable integer seed.
         total_repetitions: Target samples per candidate.
 
     Returns:
@@ -124,9 +125,7 @@ def generate_block_order(
     """
     if not candidates:
         return ["anchor", "anchor"]
-    from numpy.random import PCG64, Generator  # noqa: PLC0415
-
-    rng = Generator(PCG64(seed))
+    rng = random.Random(seed)
     remaining: dict[str, int] = {c: total_repetitions for c in candidates}
     order: list[str] = ["anchor"]
     block_len_cap = max(1, min(max_block_len, anchor_every_n))
@@ -140,7 +139,7 @@ def generate_block_order(
                 break
             max_owed = max(remaining[c] for c in still_owed)
             underfull = [c for c in still_owed if remaining[c] == max_owed]
-            idx = int(rng.integers(0, len(underfull)))
+            idx = rng.randrange(len(underfull))
             pick = underfull[idx]
             block.append(pick)
             remaining[pick] -= 1
@@ -282,7 +281,9 @@ def execute_batch(
     cfg: HarnessConfig,
     stream: CudaStream,
     build_args: Any,
+    resolve_grid_dim: Callable[[LoadedCandidate, ShapeCase], tuple[int, int, int]],
     reset_hook_per_candidate: dict[str, Callable[[], None]] | None = None,
+    before_sample: Callable[[LoadedCandidate, ShapeCase], None] | None = None,
 ) -> BatchMeasurement:
     """Execute Phase 4 for the full batch.
 
@@ -328,7 +329,9 @@ def execute_batch(
         for cand in candidates:
             sp = plan.sample_plans[(cand.candidate_hash, shape.shape_id)]
             for _ in range(sp.warmup_count):
-                _run_warmup(cand, shape, stream, build_args)
+                if before_sample is not None:
+                    before_sample(cand, shape)
+                _run_warmup(cand, shape, stream, build_args, resolve_grid_dim)
 
         candidate_samples: dict[str, list[float]] = {
             h: [] for h in candidate_hashes
@@ -340,6 +343,8 @@ def execute_batch(
         for token in order:
             if token == "anchor":
                 try:
+                    if before_sample is not None:
+                        before_sample(incumbent, shape)
                     anchor_plan = (
                         plan.sample_plans.get(
                             (candidate_hashes[0], shape.shape_id)
@@ -359,7 +364,7 @@ def execute_batch(
                         stream,
                         lambda s: build_args(incumbent, s),
                         incumbent.block_dim,
-                        incumbent.grid_dim or (1, 1, 1),
+                        resolve_grid_dim(incumbent, shape),
                         incumbent.dynamic_smem_bytes,
                         nvtx=None,
                         reset_hook=hooks.get(incumbent.candidate_hash),
@@ -377,6 +382,8 @@ def execute_batch(
                 cand = candidate_by_hash[token]
                 sp = plan.sample_plans[(cand.candidate_hash, shape.shape_id)]
                 try:
+                    if before_sample is not None:
+                        before_sample(cand, shape)
                     per_us = run_sample(
                         cand.function,
                         shape,
@@ -384,7 +391,7 @@ def execute_batch(
                         stream,
                         lambda s, c=cand: build_args(c, s),
                         cand.block_dim,
-                        cand.grid_dim or (1, 1, 1),
+                        resolve_grid_dim(cand, shape),
                         cand.dynamic_smem_bytes,
                         nvtx=None,
                         reset_hook=hooks.get(cand.candidate_hash),
@@ -424,6 +431,7 @@ def _run_warmup(
     shape: ShapeCase,
     stream: CudaStream,
     build_args: Any,
+    resolve_grid_dim: Callable[[LoadedCandidate, ShapeCase], tuple[int, int, int]],
 ) -> None:
     """Untimed warmup launch.
 
@@ -436,7 +444,7 @@ def _run_warmup(
         args = build_args(cand, shape)
         launch(
             cand.function,
-            cand.grid_dim or (1, 1, 1),
+            resolve_grid_dim(cand, shape),
             cand.block_dim,
             cand.dynamic_smem_bytes,
             stream,

@@ -128,8 +128,11 @@ def _build_request(cubin_a: Path, cubin_b: Path) -> BenchmarkBatchRequest:
             relative_to_baseline=0.75,
             relative_to_incumbent=1.0,
         ),
-        cubin_uri=None,
-        launch_spec=None,
+        cubin_uri=str(cubin_a),
+        launch_spec=launch_spec,
+        launch_spec_hash="lsh-inc",
+        source_hash="srh-inc",
+        toolchain_hash="tch-inc",
     )
     return BenchmarkBatchRequest(
         request_id="req-dry",

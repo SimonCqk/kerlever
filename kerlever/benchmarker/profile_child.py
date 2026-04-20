@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib
 import json
 import logging
@@ -195,9 +196,12 @@ def _profile_seed(
     run_id: str, batch_id: str, shape_id: str, candidate_hash: str
 ) -> int:
     """Reproduce the worker's profile-seed hash so inputs match the measurement."""
-    return hash(
-        (run_id, batch_id, shape_id, candidate_hash, "kerlever_profile_seed")
+    key = (
+        f"{run_id}|{batch_id}|{shape_id}|{candidate_hash}|"
+        "kerlever_profile_seed"
     )
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False)
 
 
 def _nvtx_push(name: str) -> None:
