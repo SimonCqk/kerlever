@@ -111,10 +111,6 @@ class Phase1RequestNormalizer:
         """Normalize the request; short-circuit on quarantine / mismatches."""
         phase_start = time.monotonic()
         try:
-            await self._idempotency.record_phase(
-                request.request_id, PhaseName.REQUEST_NORMALIZATION
-            )
-
             pod_snapshot = self._pod_health.snapshot()
 
             # Pod quarantined → short-circuit without touching anything else.
@@ -126,6 +122,11 @@ class Phase1RequestNormalizer:
             adapter = self._adapter_registry.get(request.problem_spec.op_name)
             if adapter is None:
                 return self._short_circuit_unsupported_op(request, pod_snapshot)
+            adapter_error = adapter.validate_problem_spec(request.problem_spec)
+            if adapter_error is not None:
+                return self._short_circuit_interface_contract(
+                    request, pod_snapshot, adapter, adapter_error
+                )
 
             # Interface resolution (spec §6.1).
             resolved_spec, legacy_inferred, spec_error = self._resolve_interface(
@@ -498,6 +499,12 @@ class _NullAdapter:
     ) -> set[str]:  # pragma: no cover
         del problem_spec
         return set()
+
+    def validate_problem_spec(
+        self, problem_spec: ProblemSpec
+    ) -> str | None:  # pragma: no cover
+        del problem_spec
+        return None
 
     def allocate_inputs(
         self, problem_spec: ProblemSpec, shape: ShapeCase, seed: int

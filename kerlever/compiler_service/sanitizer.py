@@ -59,6 +59,7 @@ class ComputeSanitizerRunner:
         executable: Path,
         shape: ShapeCase,
         input_dir: Path,
+        harness_args: Sequence[str] = (),
         timeout_s: float | None = None,
         report_path: Path | None = None,
     ) -> SanitizerOutcome:
@@ -69,7 +70,7 @@ class ComputeSanitizerRunner:
 
         Invariant: INV-CS-004
         """
-        del input_dir  # reserved for a future harness invocation layout
+        del input_dir  # retained for call-site readability and future layout hooks
         timeout = timeout_s or self._config.sanitizer_timeout_s
         save_path = report_path or executable.with_suffix(f".{tool.value}.report")
 
@@ -80,6 +81,7 @@ class ComputeSanitizerRunner:
             "--save",
             str(save_path),
             str(executable),
+            *harness_args,
         ]
         try:
             process = await asyncio.create_subprocess_exec(
@@ -96,7 +98,9 @@ class ComputeSanitizerRunner:
             )
 
         try:
-            _, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
         except TimeoutError:
             process.kill()
             with contextlib.suppress(Exception):
@@ -110,6 +114,12 @@ class ComputeSanitizerRunner:
 
         returncode = process.returncode or 0
         status = _classify_returncode(returncode)
+        if status is SanitizerStatus.FAIL and not save_path.exists():
+            payload = b"\n".join(
+                part for part in (stdout_bytes, stderr_bytes) if part
+            )
+            if payload:
+                save_path.write_bytes(payload[: self._config.max_artifact_bytes])
         return SanitizerOutcome(
             tool=tool,
             shape_id=shape.shape_id,

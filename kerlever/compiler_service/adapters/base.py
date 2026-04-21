@@ -64,6 +64,9 @@ class OperationAdapter(Protocol):
     def high_risk_shape_ids(self, problem_spec: ProblemSpec) -> set[str]:
         """Return shape ids the adapter considers high-risk for sanitizer."""
 
+    def validate_problem_spec(self, problem_spec: ProblemSpec) -> str | None:
+        """Return an interface-contract error reason, or None when supported."""
+
     def allocate_inputs(
         self,
         problem_spec: ProblemSpec,

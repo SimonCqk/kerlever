@@ -8,6 +8,6 @@
 # Design: docs/compiler-service/design.md §14.2
 set -euo pipefail
 
-python3.12 -m kerlever.compiler_service --probe-only
+python3 -m kerlever.compiler_service --probe-only
 
 exec "$@"

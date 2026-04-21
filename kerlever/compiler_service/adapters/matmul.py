@@ -70,6 +70,15 @@ class MatmulAdapter:
         del problem_spec
         return set()
 
+    def validate_problem_spec(self, problem_spec: ProblemSpec) -> str | None:
+        """Validate matmul-specific dtype and shape contract."""
+        if problem_spec.dtype not in _CUDA_SCALAR_TYPE:
+            return "unsupported_matmul_dtype"
+        for shape in problem_spec.shape_cases:
+            if len(shape.dims) != 3:
+                return "matmul_shape_requires_m_n_k"
+        return None
+
     def allocate_inputs(
         self,
         problem_spec: ProblemSpec,

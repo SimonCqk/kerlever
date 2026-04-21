@@ -127,9 +127,7 @@ class Phase3Compiler:
             if ref_result.timed_out:
                 return self._short_circuit_timeout(phase2, ref_result, "reference")
             if ref_result.returncode != 0:
-                return self._short_circuit_compile_error(
-                    phase2, ref_result, "reference"
-                )
+                return self._short_circuit_reference_compile_error(phase2, ref_result)
 
             if cand_result.timed_out:
                 return self._short_circuit_timeout(phase2, cand_result, "candidate")
@@ -223,8 +221,13 @@ class Phase3Compiler:
                 )
 
             resolved_spec = phase2.phase1.resolved_execution_spec
+            resource_binary = (
+                cubin_path
+                if cubin_artifact_id is not None and cubin_path.exists()
+                else candidate_bin
+            )
             static_analysis = self._resource_extractor.extract(
-                binary=candidate_bin,
+                binary=resource_binary,
                 entrypoint=resolved_spec.entrypoint or "",
                 block_dim=resolved_spec.block_dim or (1, 1, 1),
                 dynamic_smem_bytes=resolved_spec.dynamic_smem_bytes or 0,
@@ -296,6 +299,35 @@ class Phase3Compiler:
             phase=PhaseName.COMPILE,
             status=status,
             candidate_fault_kind=fault_kind,
+            cuda_error=None,
+            failure=failure,
+        )
+        return Phase3Output(
+            phase2=phase2, compile=None, static_analysis=None, short_circuit=packet
+        )
+
+    def _short_circuit_reference_compile_error(
+        self, phase2: Phase2Output, result: NvccResult
+    ) -> Phase3Output:
+        """Short-circuit when the reference harness cannot compile.
+
+        The candidate did not cause this failure. The reference source and
+        adapter harness are measurement infrastructure for the request, so the
+        result must not feed negative evidence into optimization search memory.
+        """
+        failure = FailureDetail(
+            phase=PhaseName.COMPILE,
+            command=result.command,
+            stdout_excerpt=result.stdout_excerpt,
+            stderr_excerpt=result.stderr_excerpt,
+            failing_shape_id=None,
+            retryable=False,
+            reason="reference_compile_error",
+        )
+        packet = PhaseShortCircuit(
+            phase=PhaseName.COMPILE,
+            status=CompileResultStatus.INFRA_ERROR,
+            candidate_fault_kind=None,
             cuda_error=None,
             failure=failure,
         )

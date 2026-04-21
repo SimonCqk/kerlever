@@ -3,13 +3,14 @@
 # Spec: docs/compiler-service/spec.md §6.12, REQ-CS-010, REQ-CS-013
 # Design: docs/compiler-service/design.md §14
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
 
-# System deps: Python 3.12 + build essentials for cuda-python wheels.
+# System deps: Ubuntu 24.04 ships Python 3.12 as python3.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         python3.12 \
-         python3.12-venv \
+         python3 \
+         python3-venv \
          python3-pip \
          ca-certificates \
          git \
@@ -21,8 +22,8 @@ ENV PATH="/usr/local/cuda/bin:${PATH}"
 # Install the package with the [service] optional extra.
 COPY . /opt/kerlever
 WORKDIR /opt/kerlever
-RUN python3.12 -m pip install --no-cache-dir --upgrade pip \
-    && python3.12 -m pip install --no-cache-dir ".[service]"
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir ".[service]"
 
 # Artifact root (matches ServiceConfig default).
 ENV KERLEVER_ARTIFACT_ROOT=/var/lib/kerlever/artifacts

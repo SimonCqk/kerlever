@@ -20,6 +20,7 @@ import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 from kerlever.compiler_service.config import ServiceConfig
 from kerlever.compiler_service.identity import toolchain_hash
@@ -360,21 +361,10 @@ class DriverApiAttributes:
 
     The module-level import of ``cuda`` is DEFERRED to ``try_load`` so the
     package is importable on CPU-only hosts (INV-CS-003 fallback path).
-
-    V1 non-goal (documented): ``read_registers_per_thread``,
-    ``read_static_smem_bytes``, and ``read_max_threads_per_block`` all
-    return ``None``. V1 relies exclusively on the ``ptxas -v`` fallback
-    for those facts. A V2 task will implement ``cuModuleLoadData`` +
-    ``cuFuncGetAttribute`` once the cubin artifact is routinely
-    extracted (P2-1 made that a given: see ``Phase3Compiler.run``
-    cubin-extraction block). Until then, the stubs preserve the
-    import-safe contract without fabricating data.
     """
 
-    def __init__(self) -> None:
-        # Construction only succeeds through ``try_load`` — this empty init
-        # is kept so mypy sees the class as instantiable.
-        pass
+    def __init__(self, driver_module: object) -> None:
+        self._driver = driver_module
 
     @classmethod
     def try_load(cls) -> DriverApiAttributes | None:
@@ -386,34 +376,125 @@ class DriverApiAttributes:
         try:
             import importlib
 
-            importlib.import_module("cuda.bindings.driver")
+            driver = importlib.import_module("cuda.bindings.driver")
         except ImportError:
             return None
         except Exception as exc:  # noqa: BLE001 — broad on-purpose
             logger.warning("cuda_python_import_failed", extra={"error": str(exc)})
             return None
-        return cls()
+        return cls(driver)
 
     def read_registers_per_thread(self, binary: Path, entrypoint: str) -> int | None:
         """Read ``CU_FUNC_ATTRIBUTE_NUM_REGS`` for ``entrypoint``.
 
-        V1 returns ``None`` on any lookup error — the caller falls back
-        to ptxas. A future revision may implement the driver API call in
-        full; today the function is a stub that keeps the import-safe
-        contract without fabricating data.
+        Returns ``None`` on any lookup error — the caller falls back to ptxas
+        without fabricating data.
         """
-        del binary, entrypoint
-        return None
+        return self._read_attribute(binary, entrypoint, "CU_FUNC_ATTRIBUTE_NUM_REGS")
 
     def read_static_smem_bytes(self, binary: Path, entrypoint: str) -> int | None:
         """Read ``CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES`` for ``entrypoint``."""
-        del binary, entrypoint
-        return None
+        return self._read_attribute(
+            binary, entrypoint, "CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES"
+        )
 
     def read_max_threads_per_block(self, binary: Path, entrypoint: str) -> int | None:
         """Read ``CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`` for ``entrypoint``."""
-        del binary, entrypoint
-        return None
+        return self._read_attribute(
+            binary, entrypoint, "CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK"
+        )
+
+    def _read_attribute(
+        self, binary: Path, entrypoint: str, attribute_name: str
+    ) -> int | None:
+        """Load a cubin/PTX module and read one function attribute.
+
+        The cuda-python bindings have changed package names over time; this
+        facade keeps the interaction defensive. Any import, load, symbol, or
+        enum mismatch returns ``None`` and lets the ptxas fallback stand.
+        """
+        if not binary.exists() or not entrypoint:
+            return None
+        driver = self._driver
+        module = None
+        try:
+            init = getattr(driver, "cuInit", None)
+            if init is not None and not _cuda_ok(init(0)):
+                return None
+
+            load_data = getattr(driver, "cuModuleLoadData", None)
+            get_function = getattr(driver, "cuModuleGetFunction", None)
+            get_attribute = getattr(driver, "cuFuncGetAttribute", None)
+            unload = getattr(driver, "cuModuleUnload", None)
+            if load_data is None or get_function is None or get_attribute is None:
+                return None
+
+            loaded = load_data(binary.read_bytes())
+            if not _cuda_ok(loaded):
+                return None
+            module = _cuda_payload(loaded)
+            if module is None:
+                return None
+
+            func_result = get_function(module, entrypoint.encode("utf-8"))
+            if not _cuda_ok(func_result):
+                return None
+            function = _cuda_payload(func_result)
+            if function is None:
+                return None
+
+            attribute = _cuda_enum_value(driver, attribute_name)
+            if attribute is None:
+                return None
+            attr_result = get_attribute(attribute, function)
+            if not _cuda_ok(attr_result):
+                return None
+            value = _cuda_payload(attr_result)
+            return value if isinstance(value, int) else None
+        except Exception as exc:  # noqa: BLE001 — best-effort fallback
+            logger.warning(
+                "cuda_driver_attribute_read_failed",
+                extra={"attribute": attribute_name, "error": str(exc)},
+            )
+            return None
+        finally:
+            if module is not None:
+                unload = getattr(driver, "cuModuleUnload", None)
+                if unload is not None:
+                    with contextlib.suppress(Exception):
+                        unload(module)
+
+
+def _cuda_ok(result: object) -> bool:
+    """Return True when a cuda-python call result reports success."""
+    if isinstance(result, (tuple, list)):
+        if not result:
+            return False
+        status = result[0]
+    else:
+        status = result
+    value = getattr(status, "value", status)
+    name = getattr(status, "name", "")
+    return value == 0 or name == "CUDA_SUCCESS"
+
+
+def _cuda_payload(result: object) -> object | None:
+    """Return the first payload value from a cuda-python tuple result."""
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        return cast(object, result[1])
+    return None
+
+
+def _cuda_enum_value(driver: object, attribute_name: str) -> object | None:
+    """Resolve a CUfunction_attribute enum value across binding versions."""
+    for container_name in (
+        "CUfunction_attribute",
+        "CUfunction_attribute_enum",
+    ):
+        container = getattr(driver, container_name, None)
+        if container is not None and hasattr(container, attribute_name):
+            return cast(object, getattr(container, attribute_name))
+    return cast(object | None, getattr(driver, attribute_name, None))
 
 
 @dataclass(frozen=True)

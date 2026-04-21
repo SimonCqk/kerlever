@@ -39,6 +39,7 @@ from kerlever.compiler_service.types import (
     CompileRequest,
     CompileResult,
     IdempotencyState,
+    PhaseName,
     ToolchainInfo,
 )
 
@@ -100,6 +101,7 @@ class CompilerService:
             sanitizer_runner=deps.sanitizer_runner,
             sanitizer_policy=deps.sanitizer_policy,
             pod_health=deps.pod_health,
+            idempotency=deps.idempotency,
             gpu_semaphores=deps.gpu_semaphores,
         )
 
@@ -141,6 +143,9 @@ class CompilerService:
                         request, phase1_out, phase1_out.short_circuit
                     )
 
+                await self._deps.idempotency.record_phase(
+                    request.request_id, PhaseName.HARNESS_ASSEMBLY
+                )
                 phase2_out = await self._phase2.run(phase1_out, timer)
                 if phase2_out.harness is not None:
                     workspace_to_cleanup = phase2_out.harness.workspace
@@ -149,12 +154,18 @@ class CompilerService:
                         request, phase1_out, phase2_out.short_circuit
                     )
 
+                await self._deps.idempotency.record_phase(
+                    request.request_id, PhaseName.COMPILE
+                )
                 phase3_out = await self._phase3.run(phase2_out, timer)
                 if phase3_out.short_circuit is not None:
                     return await phase5.from_short_circuit(
                         request, phase1_out, phase3_out.short_circuit
                     )
 
+                await self._deps.idempotency.record_phase(
+                    request.request_id, PhaseName.CORRECTNESS
+                )
                 phase4_out = await self._phase4.run(phase3_out, timer)
                 return await phase5.assemble(
                     request=request,

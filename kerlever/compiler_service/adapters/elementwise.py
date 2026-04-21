@@ -31,7 +31,7 @@ from kerlever.compiler_service.types import (
 )
 from kerlever.types import ProblemSpec, ShapeCase
 
-_INT_DTYPES: frozenset[str] = frozenset({"int8", "int16", "int32", "int64"})
+_SUPPORTED_DTYPES: frozenset[str] = frozenset({"fp32", "float32"})
 
 
 class ElementwiseAdapter:
@@ -57,24 +57,28 @@ class ElementwiseAdapter:
 
     def default_tolerance(self, dtype: str) -> float:
         """Per-dtype tolerance default (spec §6.2)."""
-        if dtype in ("fp16", "float16"):
-            return 1e-2
         if dtype in ("fp32", "float32"):
             return 1e-5
-        if dtype in _INT_DTYPES:
-            return 0.0
         return 1e-4
 
     def comparison_mode(self, dtype: str) -> ComparisonMode:
-        """Integers use exact; floats use tolerance (spec §6.2 / INV-CS-011)."""
-        if dtype in _INT_DTYPES:
-            return ComparisonMode.EXACT
+        """V1 skeleton supports fp32 only, compared by tolerance."""
+        del dtype
         return ComparisonMode.TOLERANCE
 
     def high_risk_shape_ids(self, problem_spec: ProblemSpec) -> set[str]:
         """Elementwise has no a priori high-risk shapes in V1."""
         del problem_spec
         return set()
+
+    def validate_problem_spec(self, problem_spec: ProblemSpec) -> str | None:
+        """Validate the V1 skeleton's deliberately narrow contract."""
+        if problem_spec.dtype not in _SUPPORTED_DTYPES:
+            return "unsupported_elementwise_dtype"
+        for shape in problem_spec.shape_cases:
+            if len(shape.dims) != 1:
+                return "elementwise_shape_requires_n"
+        return None
 
     def allocate_inputs(
         self,
@@ -171,18 +175,8 @@ class ElementwiseAdapter:
 
 def _dtype_bytes(dtype: str) -> int:
     """Byte width of a supported scalar dtype."""
-    if dtype in ("fp16", "float16"):
-        return 2
     if dtype in ("fp32", "float32"):
         return 4
-    if dtype in ("int8",):
-        return 1
-    if dtype in ("int16",):
-        return 2
-    if dtype in ("int32",):
-        return 4
-    if dtype in ("int64",):
-        return 8
     raise ValueError(f"unsupported elementwise dtype: {dtype}")
 
 

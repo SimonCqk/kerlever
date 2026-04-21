@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import time
 from collections.abc import Mapping
@@ -22,6 +23,8 @@ from kerlever.compiler_service.adapters.base import OperationAdapter
 from kerlever.compiler_service.artifact_store import ArtifactStore
 from kerlever.compiler_service.config import ServiceConfig
 from kerlever.compiler_service.envelope import PhaseTimer
+from kerlever.compiler_service.idempotency import IdempotencyRegistry
+from kerlever.compiler_service.identity import problem_spec_hash
 from kerlever.compiler_service.phases import PhaseShortCircuit
 from kerlever.compiler_service.phases.phase3_compile import Phase3Output
 from kerlever.compiler_service.pod_health import (
@@ -113,8 +116,10 @@ class _CorrectnessAccumulator:
     max_rel_error: float | None = None
     saw_nan_or_inf: bool = False
     runtime_error_shape: str | None = None
+    runtime_error_role: str | None = None
     cuda_error: CudaErrorKind | None = None
     timed_out_shape: str | None = None
+    timed_out_role: str | None = None
     shape_logs: list[_ShapeLogEntry] = field(default_factory=list)
 
 
@@ -141,6 +146,7 @@ class Phase4CorrectnessValidator:
         sanitizer_runner: ComputeSanitizerRunner,
         sanitizer_policy: SanitizerPolicy,
         pod_health: PodHealthTracker,
+        idempotency: IdempotencyRegistry,
         gpu_semaphores: Mapping[int, asyncio.Semaphore],
     ) -> None:
         self._config = config
@@ -148,6 +154,7 @@ class Phase4CorrectnessValidator:
         self._sanitizer_runner = sanitizer_runner
         self._sanitizer_policy = sanitizer_policy
         self._pod_health = pod_health
+        self._idempotency = idempotency
         self._gpu_semaphores = gpu_semaphores
 
     async def run(self, phase3: Phase3Output, timer: PhaseTimer) -> Phase4Output:
@@ -190,6 +197,7 @@ class Phase4CorrectnessValidator:
             if probe_transition is not None and probe_transition.reason == "probe_fail":
                 return self._short_circuit_probe_fail(phase3, probe_transition)
 
+            sanitizer_results: list[SanitizerOutcome] | None = None
             async with semaphore:
                 accumulator = await self._run_all_shapes(
                     phase3=phase3,
@@ -200,6 +208,27 @@ class Phase4CorrectnessValidator:
                     else Path("."),
                     resolved=resolved,
                 )
+                if (
+                    accumulator.timed_out_shape is None
+                    and accumulator.runtime_error_shape is None
+                    and accumulator.passed
+                ):
+                    await self._idempotency.record_phase(
+                        request.request_id, PhaseName.SANITIZER
+                    )
+                    sanitizer_results = await self._run_sanitizer_gate(
+                        request_source=request.source_code,
+                        problem_spec=request.problem_spec,
+                        adapter=adapter,
+                        candidate_exec=phase3.compile.candidate_executable,
+                        workspace=phase3.phase2.harness.workspace
+                        if phase3.phase2.harness
+                        else Path("."),
+                        request_run_id=request.run_id,
+                        candidate_hash=request.candidate_hash,
+                        timeout_s=phase3.phase2.phase1.envelope_seed.limits.sanitizer_timeout_s,
+                        saw_nan_or_inf=accumulator.saw_nan_or_inf,
+                    )
 
             # Update pod health. Timeouts / CUDA errors are ambiguous.
             transition = await self._report_to_tracker(accumulator)
@@ -246,14 +275,10 @@ class Phase4CorrectnessValidator:
                     correctness_log_artifact_id,
                 )
 
-            # Sanitizer gate — correctness passed.
-            sanitizer_results = await self._run_sanitizer_gate(
-                request_source=request.source_code,
-                problem_spec=request.problem_spec,
-                adapter=adapter,
-                candidate_exec=phase3.compile.candidate_executable,
-                saw_nan_or_inf=accumulator.saw_nan_or_inf,
-            )
+            # Sanitizer gate — correctness passed. It ran inside the same
+            # per-GPU semaphore as value correctness.
+            if sanitizer_results is None:
+                sanitizer_results = []
 
             correctness_ext = _build_correctness_ext(
                 accumulator,
@@ -326,15 +351,7 @@ class Phase4CorrectnessValidator:
         assert phase3.compile is not None  # noqa: S101 — caller-guaranteed
 
         for shape in request_problem_spec.shape_cases:
-            seed = abs(
-                hash(
-                    (
-                        shape.shape_id,
-                        request_problem_spec.dtype,
-                        "kerlever_correctness",
-                    )
-                )
-            )
+            seed = _shape_seed(request_problem_spec, shape)
             bundle = adapter.allocate_inputs(request_problem_spec, shape, seed)
 
             shape_dir = workspace / "shapes" / shape.shape_id
@@ -354,6 +371,10 @@ class Phase4CorrectnessValidator:
                 phase3.compile.candidate_executable, a_path, b_path, cand_out, shape
             )
             timeout = self._config.correctness_timeout_s
+            timeout = (
+                phase3.phase2.phase1.envelope_seed.limits.correctness_timeout_s
+                or timeout
+            )
 
             ref_result = await _run_executable(argv_ref, timeout=timeout)
             if ref_result.timed_out or ref_result.returncode != 0:
@@ -361,8 +382,10 @@ class Phase4CorrectnessValidator:
                 # infra through the accumulator flags.
                 if ref_result.timed_out:
                     accumulator.timed_out_shape = shape.shape_id
+                    accumulator.timed_out_role = "reference"
                 else:
                     accumulator.runtime_error_shape = shape.shape_id
+                    accumulator.runtime_error_role = "reference"
                     accumulator.cuda_error = ref_result.cuda_error
                 accumulator.shape_logs.append(
                     _ShapeLogEntry(
@@ -382,6 +405,7 @@ class Phase4CorrectnessValidator:
             cand_result = await _run_executable(argv_cand, timeout=timeout)
             if cand_result.timed_out:
                 accumulator.timed_out_shape = shape.shape_id
+                accumulator.timed_out_role = "candidate"
                 accumulator.shape_logs.append(
                     _ShapeLogEntry(
                         shape_id=shape.shape_id,
@@ -398,6 +422,7 @@ class Phase4CorrectnessValidator:
                 continue
             if cand_result.returncode != 0:
                 accumulator.runtime_error_shape = shape.shape_id
+                accumulator.runtime_error_role = "candidate"
                 accumulator.cuda_error = cand_result.cuda_error
                 accumulator.shape_logs.append(
                     _ShapeLogEntry(
@@ -463,6 +488,10 @@ class Phase4CorrectnessValidator:
         problem_spec: ProblemSpec,
         adapter: OperationAdapter,
         candidate_exec: Path,
+        workspace: Path,
+        request_run_id: str,
+        candidate_hash: str,
+        timeout_s: float | None,
         saw_nan_or_inf: bool,
     ) -> list[SanitizerOutcome]:
         """Run ``memcheck`` + any escalation tools (spec §6.7)."""
@@ -478,13 +507,43 @@ class Phase4CorrectnessValidator:
 
         outcomes: list[SanitizerOutcome] = []
         for tool in tools:
+            shape_dir = workspace / "shapes" / smallest.shape_id
+            report_path = shape_dir / f"sanitizer-{tool.value}.report"
+            out_path = shape_dir / f"sanitizer-{tool.value}.out"
+            harness_args = _shape_argv(
+                candidate_exec,
+                shape_dir / "A.bin",
+                shape_dir / "B.bin",
+                out_path,
+                smallest,
+            )[1:]
             outcome = await self._sanitizer_runner.run(
                 tool=tool,
                 executable=candidate_exec,
                 shape=smallest,
                 input_dir=candidate_exec.parent,
-                timeout_s=self._config.sanitizer_timeout_s,
+                harness_args=harness_args,
+                timeout_s=timeout_s or self._config.sanitizer_timeout_s,
+                report_path=report_path,
             )
+            if outcome.status is SanitizerStatus.FAIL and report_path.exists():
+                try:
+                    report_artifact_id = await self._artifact_store.write(
+                        kind=ArtifactKind.SANITIZER_REPORT,
+                        data=report_path.read_bytes()[
+                            : self._config.max_artifact_bytes
+                        ],
+                        run_id=request_run_id,
+                        candidate_hash=candidate_hash,
+                    )
+                    outcome = outcome.model_copy(
+                        update={"report_artifact_id": report_artifact_id}
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort evidence
+                    logger.warning(
+                        "sanitizer_report_write_failed",
+                        extra={"tool": tool.value, "error": str(exc)},
+                    )
             outcomes.append(outcome)
             if outcome.status is SanitizerStatus.TIMEOUT:
                 break
@@ -587,6 +646,8 @@ class Phase4CorrectnessValidator:
                     cuda_error=accumulator.cuda_error,
                 )
             )
+        if accumulator.runtime_error_role == "reference":
+            return None
         if accumulator.failing_shape_ids or accumulator.runtime_error_shape:
             return await self._pod_health.record_phase4_outcome(
                 Phase4Classification(
@@ -695,8 +756,16 @@ class Phase4CorrectnessValidator:
         probe_transition: PodHealthTransition | None,
         correctness_log_artifact_id: str | None,
     ) -> Phase4Output:
-        """Short-circuit on a candidate runtime error."""
+        """Short-circuit on a runtime error from reference or candidate."""
         del tolerance, tolerance_source, comparison_mode
+        if accumulator.runtime_error_role == "reference":
+            return self._short_circuit_reference_runtime_error(
+                phase3,
+                accumulator,
+                transition,
+                probe_transition,
+                correctness_log_artifact_id,
+            )
         failure = FailureDetail(
             phase=PhaseName.CORRECTNESS,
             failing_shape_id=accumulator.runtime_error_shape,
@@ -707,6 +776,37 @@ class Phase4CorrectnessValidator:
             phase=PhaseName.CORRECTNESS,
             status=CompileResultStatus.CORRECTNESS_FAIL,
             candidate_fault_kind=CandidateFaultKind.CANDIDATE_RUNTIME_ERROR,
+            cuda_error=accumulator.cuda_error,
+            failure=failure,
+        )
+        merged = transition or probe_transition
+        return Phase4Output(
+            phase3=phase3,
+            correctness_outcome=None,
+            short_circuit=packet,
+            pod_health_transition=merged,
+            correctness_log_artifact_id=correctness_log_artifact_id,
+        )
+
+    def _short_circuit_reference_runtime_error(
+        self,
+        phase3: Phase3Output,
+        accumulator: _CorrectnessAccumulator,
+        transition: PodHealthTransition | None,
+        probe_transition: PodHealthTransition | None,
+        correctness_log_artifact_id: str | None,
+    ) -> Phase4Output:
+        """Short-circuit when the reference executable fails during correctness."""
+        failure = FailureDetail(
+            phase=PhaseName.CORRECTNESS,
+            failing_shape_id=accumulator.runtime_error_shape,
+            retryable=False,
+            reason="reference_runtime_error",
+        )
+        packet = PhaseShortCircuit(
+            phase=PhaseName.CORRECTNESS,
+            status=CompileResultStatus.INFRA_ERROR,
+            candidate_fault_kind=None,
             cuda_error=accumulator.cuda_error,
             failure=failure,
         )
@@ -938,6 +1038,19 @@ def _shape_argv(
     args = [str(executable), str(a_path), str(b_path), str(out_path)]
     args.extend(str(int(dim)) for dim in shape.dims)
     return args
+
+
+def _shape_seed(problem_spec: ProblemSpec, shape: ShapeCase) -> int:
+    """Stable deterministic input seed for one correctness shape."""
+    payload = "\0".join(
+        (
+            problem_spec_hash(problem_spec),
+            shape.shape_id,
+            problem_spec.dtype,
+            "kerlever_correctness",
+        )
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big")
 
 
 def _resolve_tolerance(
